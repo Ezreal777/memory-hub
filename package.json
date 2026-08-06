@@ -1,0 +1,20 @@
+{
+  "name": "memory-hub",
+  "version": "0.1.0",
+  "description": "Memory Hub - AI App 记忆中转站（CLI + launchd 守护）",
+  "type": "module",
+  "bin": {
+    "hub": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 test/*.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "commander": "^12.1.0",
+    "gray-matter": "^4.0.3"
+  }
+}
