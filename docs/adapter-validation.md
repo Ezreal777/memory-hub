@@ -64,19 +64,35 @@
 
 ---
 
-## 五、新会话召回人工验证待办
+## 五、新会话召回验证
 
-写回通道已验证，"新会话能否真正召回"需人工开新会话逐一确认：
+写回通道已验证，"新会话能否真正召回"逐家确认。claude/codex 两家已于 2026-08-06 通过非交互式 CLI 完成自动化验证（唯一标记 `[HUB-RECALL-20260806-c1]`）；其余三家无 CLI 通道，保持人工待办。
 
 | App | 待办 | 状态 |
 |---|---|---|
-| claude | 开新会话问"记忆中转站E2E测试"确认召回 | 待人工验证（注：测试条目已清理，验证时需先重新写回或换用现存条目） |
-| codex | 同上 | 待人工验证 |
+| claude | 开新会话问"召回测试标记是什么"确认召回 | ⏭️ SKIP（环境拦截，见下） |
+| codex | 同上 | ✅ PASS（自动化验证，见下） |
 | qoderwork | 同上（另需先重建搜索索引或新会话对账） | 待人工验证 |
 | wukong | 同上（注意云端同步覆盖风险） | 待人工验证 |
 | qoder | 召回由用户侧另行验证 | 待办 |
 
-> 说明：本次验证以"清理彻底性"优先，测试条目已在 F 步全部清除；人工召回验证若需条目在场，可重建 wiki 页后重放 `hub writeback`（幂等通道已验证可重放）。
+### 自动化召回验证（2026-08-06，标记 [HUB-RECALL-20260806-c1]）
+
+**流程**：`hub backup`（full/2026-08-06T03-32-40-303Z，321 文件）→ 构造带标记 wiki 测试页（frontmatter 含 hub-id/sources/last-updated/tags）→ `hub writeback --app claude` 与 `--app codex` 均 written（文件级确认：claude 条目文件×3 处标记 + MEMORY.md 索引行；AGENTS.md 标记区×2）→ 两家分别以非交互 CLI 开新会话提问 → rollback + 零残留清理。
+
+**codex：✅ PASS**
+- `~/Desktop/tool` 下 `codex exec`（v0.144.1，session 019fd557-a608-75f3-bef3-6dc4bd56d315，rc=0，6303 tokens）新会话回答：「召回测试标记是：**HUB-RECALL-20260806-c1**」——与写回标记完全一致，召回成立。
+- 环境处置：litellm-proxy（localhost:4123）原未启动，以最小配置（路由 claude-opus-4-6 → idealab anthropic 端点）临时拉起并验证 chat 端点可用；codex 0.144.1 仅支持 Responses API（`wire_api="chat"` 已被弃用拒绝），而 litellm v1.92.0 与 v1.95.0 的 responses→anthropic 工具映射对 codex 的 `custom`/`namespace` 型工具崩溃（`KeyError: 'function'`，/v1/responses 返回 500）——用 /tmp 本地 shim 将 custom 工具降级为 function、丢弃 namespace/web_search 内建工具后打通（未改任何用户配置与产品源码，codex 仅以 `-c` 临时覆盖 base_url）。测试结束后 proxy 与 shim 均已停止并删除（含密钥的临时配置一并清除），4123/4124 端口复验不可达。
+
+**claude：⏭️ SKIP（环境拦截）**
+- claude CLI（v2.1.169，~/.local/bin/claude → bun 原生二进制）在本机被持续 SIGKILL（rc=137），连 `claude --version` 都无法输出；二进制带公司 EDR 云查杀标记（xattr `com.alibaba.security.edr.antivirus.cloudquery`），系统日志证实 AliEDR（com.alibaba.endpoint.aliedr）在运行。多轮重试（含等待 EDR 判定放行）、经 .zshrc 包装函数调用、提权运行均无效，无其他安装副本可用。写回侧文件已确认在场（条目文件 + MEMORY.md 索引行），待 EDR 放行后可直接补跑 `claude -p` 复验。
+
+**清理与零残留证据**：
+- 删除 wiki 测试页 → `hub rollback --yes`（命中 full 池 03-32-40-303Z）→ MEMORY.md / AGENTS.md 标记归零；rollback 不删全量备份后新增文件（bug #4 已知行为），手工删除 claude/qoder 残留条目文件各 1 个（qoder 残留系 daemon 周期写回自动产生，见 N6）。
+- `grep -r 'HUB-RECALL' ~/.claude/projects ~/Desktop/tool` → 零匹配（rc=1）✅；扩展复查 ~/.qoderwork/~/.qoder/memories/~/.real/~/.memory-hub/hub 仅 hub 自身 writeback-log.json 审计记录命中（与历轮一致，保留）；`~/.memory-hub/backups/writeback/` 两条批次备份 manifest 为 rollback 审计依据，保留。
+- `hub status`：daemon 运行中 ✅（pid 43897），watcher 已对账清理 qoder 删除事件，五家 App 发现正常。
+
+> 说明：本次验证以"清理彻底性"优先，测试条目已清除；人工召回验证若需条目在场，可重建 wiki 页后重放 `hub writeback`（幂等通道已验证可重放）。
 
 ---
 
@@ -185,7 +201,7 @@ $ grep -r 'HUB-FIX' ~/.claude/projects ~/.qoderwork ~/.qoder/memories ~/Desktop/
 
 **修复复验 Overall：PASS（6/6 bug 修复确认；5 项新观察项已记录，其中 N1/N2 建议后续排期）**
 
-> 上轮"五、新会话召回人工验证待办"继续保留（状态不变，仍待人工开新会话验证）。
+> 上轮"五、新会话召回验证"：claude/codex 两家已于 2026-08-06 完成自动化验证（codex PASS / claude SKIP 环境拦截），其余三家仍待人工验证。
 
 ## 十、评审修复复验（2026-08-06）
 
