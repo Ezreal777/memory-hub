@@ -45,6 +45,7 @@ export function writebackLogPath() {
  * 全局写回锁路径：~/.memory-hub/state/write.lock（H2 修复）。
  * daemon 与 CLI 的 runWriteback 真实写入段全部持此锁，
  * 避免两个进程同时对同一 App 记忆文件做「读全文→合并→替换」互相吞内容。
+ * RV-O1：实际锁文件就叫 state/write.lock（lockPathFor 对 .lock 结尾的目标不追加双后缀）。
  * @returns {string}
  */
 export function writeLockPath() {

@@ -516,6 +516,7 @@ export function sweepStaleTmpFiles(dirs) {
  *   writebackIntervalMs?: number, // writeback 轮询间隔（缺省 10 分钟）
  *   distillFn?: Function,         // 可注入（测试用）
  *   writebackFn?: Function,       // 可注入（测试用）
+ *   degradedWarnIntervalMs?: number, // RV-O2：降级配置周期提醒间隔（缺省 30 分钟）
  * }} [opts]
  * @returns {Promise<{ stop: Function }>} 控制句柄
  * @throws {Error} pid 锁被存活进程占用时抛出
@@ -524,10 +525,12 @@ export async function runDaemon(opts = {}) {
   // H3：config 损坏时降级 defaultConfig 并记 error，绝不在入口抛出
   // （否则 KeepAlive + ThrottleInterval 30s 会形成崩溃重启风暴）
   let config = opts.config;
+  let configDegraded = false;
   if (!config) {
     try {
       config = loadConfig();
     } catch (err) {
+      configDegraded = true;
       config = defaultConfig();
       logDaemon('error', `config.json 加载失败，降级使用缺省配置: ${err.message}（请修复 ~/.memory-hub/config.json）`);
     }
@@ -627,13 +630,37 @@ export async function runDaemon(opts = {}) {
     }
   }, writebackMs);
 
-  // 5. 优雅停止：停 watcher、清定时器、释放 pid 锁，exit 0（KeepAlive 不重拉）
+  // 5. RV-O2：降级配置期间周期性重复提醒（缺省每 30 分钟），直到 config 恢复正常；
+  //    恢复后热加载新配置（同一 config 对象引用，定时器闭包直接生效），
+  //    watcher 监听路径变化仍需重启 daemon 才能生效，日志中已注明。
+  let degradedTimer = null;
+  if (configDegraded) {
+    const degradedMs = Number.isFinite(opts.degradedWarnIntervalMs)
+      ? opts.degradedWarnIntervalMs
+      : 30 * 60 * 1000;
+    degradedTimer = setInterval(() => {
+      if (stopping) return;
+      try {
+        const fresh = loadConfig();
+        Object.assign(config, fresh);
+        configDegraded = false;
+        clearInterval(degradedTimer);
+        degradedTimer = null;
+        logDaemon('info', 'config.json 已恢复可解析，daemon 已热加载新配置（watcher 监听路径如有变化需 hub daemon stop → start 生效）');
+      } catch {
+        logDaemon('warn', 'config.json 解析失败，正在使用缺省配置，请修复后重启 daemon');
+      }
+    }, degradedMs);
+  }
+
+  // 6. 优雅停止：停 watcher、清定时器、释放 pid 锁，exit 0（KeepAlive 不重拉）
   const shutdown = async (sig) => {
     if (stopping) return;
     stopping = true;
     logDaemon('info', `收到 ${sig}，优雅停止`);
     clearInterval(distillTimer);
     clearInterval(writebackTimer);
+    if (degradedTimer) clearInterval(degradedTimer);
     try {
       await watcher.stop();
     } catch (err) {
@@ -661,6 +688,7 @@ export async function runDaemon(opts = {}) {
       stopping = true;
       clearInterval(distillTimer);
       clearInterval(writebackTimer);
+      if (degradedTimer) clearInterval(degradedTimer);
       process.off('SIGINT', onSigint);
       process.off('SIGTERM', onSigterm);
       await watcher.stop();

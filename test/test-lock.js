@@ -171,3 +171,24 @@ test('H1 多进程并发：并发 registerInflight 不丢条目（daemon 与 CLI
     assert.ok(entries[`/tmp/mh-mp-proc-${i}`], `条目 proc-${i} 不得丢失`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// RV-O1：.lock 结尾的目标不追加双后缀（全局写回锁实际文件就是 state/write.lock）
+// ---------------------------------------------------------------------------
+
+test('RV-O1：lockPathFor 对 .lock 结尾目标不再追加后缀，普通目标仍追加', () => {
+  assert.equal(lockPathFor('/x/state/write.lock'), '/x/state/write.lock', '不得出现 write.lock.lock');
+  assert.equal(lockPathFor('/x/state/inflight.json'), '/x/state/inflight.json.lock');
+});
+
+test('RV-O1：全局写回锁持锁期间实际锁文件恰为 state/write.lock', async () => {
+  freshHubRoot();
+  const { writeLockPath } = await import('../src/writeback.js');
+  const lockTarget = writeLockPath();
+  assert.equal(lockTarget.endsWith(path.join('state', 'write.lock')), true);
+  await withLock(lockTarget, async () => {
+    assert.equal(fs.existsSync(lockTarget), true, '持锁期间应存在 state/write.lock');
+    assert.equal(fs.existsSync(`${lockTarget}.lock`), false, 'write.lock.lock 双后缀不得存在');
+  });
+  assert.equal(fs.existsSync(lockTarget), false, '释放后锁文件应已删除');
+});

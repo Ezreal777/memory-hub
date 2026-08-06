@@ -6,7 +6,8 @@
  * （inflight 丢条目 → 回环抑制失效；hash-state 丢指纹 → 重复摄取等）。
  *
  * 实现：基于 O_EXCL lockfile 的跨进程互斥。
- * - withLock(target, fn)：抢占 `<target>.lock`（O_CREAT|O_EXCL 原子创建），
+ * - withLock(target, fn)：抢占 `<target>.lock`（O_CREAT|O_EXCL 原子创建；
+ *   target 已以 .lock 结尾时锁文件即 target 本身，避免双后缀），
  *   执行 fn 后释放；fn 可为同步或 async（async 时在 settle 后才释放）。
  * - 自旋重试 + 随机退避（初始 5ms 起步、指数放大至 200ms 封顶并叠加抖动）；
  * - 超时兜底：缺省 10s 未抢到锁抛出明确错误，绝不无限等待；
@@ -41,11 +42,13 @@ export function isPidAlive(pid) {
 
 /**
  * 目标文件对应的锁文件路径（同目录 `<file>.lock`）。
+ * RV-O1：目标本身已以 `.lock` 结尾时直接复用（如全局写回锁 state/write.lock），
+ * 避免出现 write.lock.lock 双后缀误导排障。
  * @param {string} file 被保护文件绝对路径
  * @returns {string}
  */
 export function lockPathFor(file) {
-  return `${file}.lock`;
+  return file.endsWith('.lock') ? file : `${file}.lock`;
 }
 
 /** 同步休眠（Atomics.wait，不烧 CPU；失败退化为忙等） */

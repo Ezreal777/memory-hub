@@ -101,6 +101,13 @@ export class Watcher {
 
     // ready 信号：供调用方（测试 / daemon）等待监听就绪后再动作
     this._readyPromise = new Promise((resolve) => {
+      if (targets.length === 0) {
+        // 0 路径时 chokidar 不触发 ready（如 config 损坏降级无 memory_paths），
+        // 立即 resolve 避免 whenReady 永久挂起
+        logWatcher('watcher', '', '无监听路径，watcher 直接就绪');
+        resolve();
+        return;
+      }
       this.chokidarWatcher.once('ready', () => resolve());
     });
 

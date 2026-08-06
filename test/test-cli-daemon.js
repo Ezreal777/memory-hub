@@ -14,7 +14,8 @@
  * 5. hub sync 在隔离环境跑通全链路（harvest → distill 优雅降级 → writeback）；
  * 6. hub backup + rollback：同一时间戳目录 + manifest 映射、无 manifest 拒绝执行、
  *    二次确认（取消不写入 / 确认恢复 / --yes 跳过）；
- * 7. daemon 主循环：启动持锁、二次启动拒绝、优雅停止释放锁、日志落盘。
+ * 7. daemon 主循环：启动持锁、二次启动拒绝、优雅停止释放锁、日志落盘；
+ * 8. RV-O2：config 损坏降级期间周期性重复 warn，修复后热加载自动恢复。
  *
  * 运行：npm test 或 node test/test-cli-daemon.js
  */
@@ -416,3 +417,48 @@ test('daemon 主循环：启动持锁、二次启动拒绝、优雅停止释放�
   await handle.stop();
   assert.equal(fs.existsSync(daemonPidPath()), false);
 });
+
+// ---------------------------------------------------------------------------
+// 8. RV-O2：降级配置期间周期性重复 warn，config 修复后自动恢复并停止提醒
+// ---------------------------------------------------------------------------
+
+test('RV-O2：config 损坏降级期间周期性重复 warn，修复后热加载恢复', async () => {
+  freshHubRoot();
+  ensureHubDirs();
+  // 写入非法 config.json → 入口 loadConfig 抛错 → 降级 defaultConfig
+  fs.writeFileSync(paths.config, '{ 非法 JSON');
+
+  const handle = await runDaemon({
+    distillIntervalMs: 60 * 60 * 1000, // 长间隔，排除干扰
+    writebackIntervalMs: 60 * 60 * 1000,
+    degradedWarnIntervalMs: 30,
+    distillFn: async () => ({ ok: true, pending: 0 }),
+    writebackFn: async () => ({ appResults: [] }),
+  });
+
+  // 降级期间至少两轮提醒：重复 warn 而非只记一条
+  await new Promise((r) => setTimeout(r, 120));
+  let log = fs.readFileSync(daemonLogPath(), 'utf8');
+  assert.match(log, /config\.json 加载失败，降级使用缺省配置/, '启动时应记一次 error');
+  const warns = log.match(/config\.json 解析失败，正在使用缺省配置/g) || [];
+  assert.ok(warns.length >= 2, `降级期间应周期性重复 warn（实际 ${warns.length} 条）`);
+
+  // 修复 config.json → 下一轮自动恢复，停止提醒并记 info
+  fs.writeFileSync(paths.config, JSON.stringify(loadConfigSchema()));
+  await new Promise((r) => setTimeout(r, 120));
+  log = fs.readFileSync(daemonLogPath(), 'utf8');
+  assert.match(log, /config\.json 已恢复可解析/, '恢复后应记 info');
+  const warnsBefore = warns.length;
+  await new Promise((r) => setTimeout(r, 80));
+  const warnsAfter = (fs.readFileSync(daemonLogPath(), 'utf8').match(/正在使用缺省配置/g) || []).length;
+  assert.equal(warnsAfter, warnsBefore, '恢复后不得继续记降级 warn');
+
+  await handle.stop();
+  assert.equal(fs.existsSync(daemonPidPath()), false);
+});
+
+/** 造一份最小合法 config（基于缺省配置，避免 mergeWithDefaults 依赖） */
+function loadConfigSchema() {
+  // 直接复用 defaultConfig 产出，保证 loadConfig 可解析
+  return { apps: [], llm: {}, writeback: {} };
+}
