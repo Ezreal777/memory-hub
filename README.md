@@ -11,9 +11,13 @@
 ```bash
 git clone <本仓库> && cd memory-hub
 npm install
-npm link          # 注册全局命令 hub
+npm link          # 注册全局命令 hub（nvm 环境下落在 ~/.nvm 内，无需 sudo）
 hub --version
 ```
+
+> 开发模式也可不经 link 直接运行 `node src/cli.js <命令>`，行为与 `hub` 完全等价
+>（`hub` 本身就是指向 `src/cli.js` 的全局软链）。注意：launchd 守护的 plist
+> 固定使用 node 绝对路径 + `cli.js`，不依赖 `hub` shim，卸载/重装 link 不影响 daemon。
 
 ## 快速上手（五步）
 
