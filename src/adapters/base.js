@@ -184,6 +184,17 @@ export class BaseAdapter {
   }
 
   /**
+   * 判断某路径是否属于本适配器可摄取的记忆文件（M1 摄取白名单）。
+   * 默认与 owns 一致；各子类按各自实测格式覆盖收紧
+   * （防监听整目录时把任意用户文档摄取 → 发 LLM → 回灌五家）。
+   * @param {string} filePath 事件路径
+   * @returns {boolean}
+   */
+  isIngestible(filePath) {
+    return this.owns(filePath);
+  }
+
+  /**
    * 读取单文件元信息（默认实现，直接复用 readFileMeta）。
    * @param {string} filePath 文件绝对路径
    * @returns {{ path: string, content: string, mtimeMs: number, sha256: string }|null}

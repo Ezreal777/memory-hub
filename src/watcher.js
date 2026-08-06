@@ -21,6 +21,7 @@ import { isIgnoredPath, readFileMeta } from './adapters/base.js';
 import { createAdapters, findAdapterByPath } from './adapters/registry.js';
 import { loadHashState, recordFile, removeFileState, ingest, harvest } from './hub-store.js';
 import { consumeInflight } from './inflight.js';
+import { appendLogEntry } from './util/log.js';
 
 // 回环抑制 API 集中在 inflight.js（避免 watcher ↔ adapters 循环依赖）；
 // 对外仍在 watcher.js 再导出，保持既有调用方（写回引擎/测试）兼容。
@@ -33,18 +34,14 @@ const LOG_PATH = () => path.join(paths.logs, 'watcher.log');
  * 追加一条 watcher 日志（时间 / app / 文件 / 动作）。
  * 说明：日志为运维流水，使用普通 append 而非 safe-write 的备份式原子追加，
  * 避免高频追加产生海量备份；内容只含路径与动作，绝不出现密钥。
+ * L1：统一走 appendLogEntry（超 5MB 自动滚动，保留最近 3 份）。
  * @param {string} app app id（或 watcher）
  * @param {string} file 相关文件路径
  * @param {string} action 动作描述
  */
 export function logWatcher(app, file, action) {
-  try {
-    ensureDir(paths.logs);
-    const ts = new Date().toISOString();
-    fs.appendFileSync(LOG_PATH(), `${ts}\t${app}\t${action}\t${file}\n`);
-  } catch {
-    // 日志失败不影响主流程
-  }
+  const ts = new Date().toISOString();
+  appendLogEntry(LOG_PATH(), `${ts}\t${app}\t${action}\t${file}`);
 }
 
 /**
@@ -170,6 +167,13 @@ export class Watcher {
     const adapter = findAdapterByPath(this.adapters, filePath);
     if (!adapter) return;
 
+    // M1 摄取白名单：监听目录下的非记忆文件（如用户文档）直接丢弃，
+    // 防误摄取 → 发 LLM → 回灌五家；与各自 discover 口径保持一致。
+    if (!adapter.isIngestible(filePath)) {
+      logWatcher(adapter.id, filePath, 'skip 非白名单文件，丢弃');
+      return;
+    }
+
     const meta = readFileMeta(filePath);
     if (!meta) {
       // 读取失败（可能恰好被删）：清理状态
@@ -177,11 +181,14 @@ export class Watcher {
       return;
     }
 
-    // 回环抑制：命中自写（精确路径+hash，或 qoder 目录级宽限窗口）直接丢弃；
-    // 同时记录对账指纹，避免后续轮询兜底把自写内容再次摄取。
+    // 回环抑制：命中自写（精确路径+hash，或 qoder 目录级宽限窗口）直接丢弃。
+    // M3：仅精确命中才同步记对账指纹；dirWindow 命中只丢弃事件不写指纹，
+    // 否则窗口期内的真实外部修改会被永久漏摄取（窗口过期后轮询对账兜底）。
     const suppress = consumeInflight(filePath, meta.sha256);
     if (suppress) {
-      recordFile(filePath, meta.sha256, meta.mtimeMs, adapter.id);
+      if (suppress.match === 'exact') {
+        recordFile(filePath, meta.sha256, meta.mtimeMs, adapter.id);
+      }
       logWatcher(
         adapter.id,
         filePath,

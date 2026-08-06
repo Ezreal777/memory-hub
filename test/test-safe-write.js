@@ -310,7 +310,8 @@ test('config.json 首次生成：5 个默认 app、权限 600、目录权限 700
   assert.ok(config.apps.every((a) => Array.isArray(a.memory_paths) && a.memory_paths.length === 0));
   assert.equal(config.debounceMs, 2000);
   assert.equal(config.pollIntervalMs, 60000);
-  assert.equal(config.hubRoot, '~/.memory-hub/hub');
+  // L6：hubRoot 死配置已移除（数据根目录一律用 MEMORY_HUB_ROOT 环境变量指定）
+  assert.equal(config.hubRoot, undefined);
   assert.equal(config.writeback.batch3Enabled, false, '高风险批次默认关闭');
   assert.deepEqual(config.llm, { baseUrl: '', model: '', keyRef: '' });
 

@@ -17,13 +17,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
-import { FILE_MODE } from './util/paths.js';
+import { FILE_MODE, paths } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
 import { storePaths, ensureHubStore, generateMasterIndex } from './hub-store.js';
 import { slugify } from './adapters/base.js';
 import { loadConfig } from './config.js';
 import { resolveApiKey } from './keys.js';
 import { createLlmClient, LLM_CONFIG_HINT } from './llmClient.js';
+import { appendLogEntry } from './util/log.js';
 
 /** distill 对账状态文件：hub/state/distill-state.json */
 export function distillStatePath() {
@@ -133,26 +134,37 @@ function listSnapshotFiles() {
  * @returns {Object|null} { file, hubId, app, title, ingestedAt, body }
  */
 function readSnapshot(file) {
+  let content;
   try {
-    const content = fs.readFileSync(file, 'utf8');
-    const parsed = matter(content);
-    const hubId = parsed.data?.hubId;
-    if (!hubId) return null;
-    // 去掉首个 `# 标题` 行，避免与正文重复
-    const lines = String(parsed.content || '').split(/\r?\n/);
-    const h1 = lines.findIndex((l) => /^#\s+/.test(l));
-    if (h1 !== -1) lines.splice(h1, 1);
-    return {
-      file,
-      hubId: String(hubId),
-      app: String(parsed.data?.app || ''),
-      title: String(parsed.data?.title || ''),
-      ingestedAt: String(parsed.data?.ingestedAt || ''),
-      body: lines.join('\n').trim(),
-    };
+    content = fs.readFileSync(file, 'utf8');
   } catch {
     return null;
   }
+  let parsed;
+  try {
+    parsed = matter(content);
+  } catch (err) {
+    // H5：解析失败不再静默吞掉，记 warn（含文件路径）便于运维定位损坏快照
+    appendLogEntry(
+      path.join(paths.logs, 'distill.log'),
+      `${new Date().toISOString()}\twarn\t快照 frontmatter 解析失败，跳过: ${file} (${err.message})`,
+    );
+    return null;
+  }
+  const hubId = parsed.data?.hubId;
+  if (!hubId) return null;
+  // 去掉首个 `# 标题` 行，避免与正文重复
+  const lines = String(parsed.content || '').split(/\r?\n/);
+  const h1 = lines.findIndex((l) => /^#\s+/.test(l));
+  if (h1 !== -1) lines.splice(h1, 1);
+  return {
+    file,
+    hubId: String(hubId),
+    app: String(parsed.data?.app || ''),
+    title: String(parsed.data?.title || ''),
+    ingestedAt: String(parsed.data?.ingestedAt || ''),
+    body: lines.join('\n').trim(),
+  };
 }
 
 /**
@@ -219,7 +231,10 @@ export function normalizePages(json) {
     const content = String(p.content ?? '').trim();
     const title = String(p.title ?? '').trim();
     if (!content && !title) continue;
-    const slug = slugify(p.slug || title || 'topic');
+    // H4：slug 与 README 占位/隐藏名冲突时自动加后缀，
+    // 防覆盖 README.md 占位文件且永不被主索引收录。
+    let slug = slugify(p.slug || title || 'topic');
+    if (slug.toLowerCase() === 'readme' || slug.startsWith('.')) slug = `${slug}-page`;
     out.push({
       slug,
       title: title || slug,
@@ -243,6 +258,40 @@ export function buildRealClient(config) {
   }
   const apiKey = resolveApiKey(); // 未配置 keyRef / Keychain 缺失时抛明确错误
   return createLlmClient({ baseUrl: config.llm.baseUrl, model: config.llm.model, apiKey });
+}
+
+/**
+ * H4：跨批次同 slug 撞名时合并旧页，绝不整文件覆盖丢内容。
+ * 策略（实现成本合理且确定性可测）：
+ * - frontmatter 的 hub-id / sources 取并集（去重），tags 并集，last-updated 取新；
+ * - 旧正文原样保留，新内容追加为「## 更新（<时间>）」区。
+ * @param {string} oldContent 旧页全文（frontmatter + 正文）
+ * @param {Object} p 新页 { title, tags, hubIds, sources, content }
+ * @param {string} now ISO 时间
+ * @returns {{ fm: Object, body: string }}
+ */
+export function mergePageContent(oldContent, p, now) {
+  let oldFm = {};
+  let oldBody = oldContent;
+  try {
+    const parsed = matter(oldContent);
+    oldFm = parsed.data || {};
+    oldBody = String(parsed.content || '').trim();
+  } catch {
+    // 旧页不可解析：整体当正文保留，内容绝不丢
+    oldBody = String(oldContent).trim();
+  }
+  const union = (a, b) => [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])];
+  const fm = {
+    'hub-id': union(oldFm['hub-id'], p.hubIds),
+    sources: union(oldFm.sources, p.sources),
+    'last-updated': now,
+    tags: union(oldFm.tags, p.tags),
+  };
+  const body = oldBody
+    ? `${oldBody}\n\n## 更新（${now}）\n\n${p.content}`
+    : `# ${p.title}\n\n${p.content}`;
+  return { fm, body };
 }
 
 /**
@@ -311,18 +360,33 @@ export async function distill(opts = {}) {
     return { ok: true, dryRun: true, pending: snapshots.length, pages };
   }
 
-  // 落盘 wiki 页面 + 记录已处理 hubId
+  // 落盘 wiki 页面 + 记录已处理 hubId（H4：同 slug 已存在时合并而非覆盖）
   const written = [];
   const now = new Date().toISOString();
   for (const p of pages) {
-    const fm = {
-      'hub-id': p.hubIds,
-      sources: p.sources,
-      'last-updated': now,
-      tags: p.tags,
-    };
     const pagePath = path.join(storePaths.wiki, `${p.slug}.md`);
-    atomicWrite(pagePath, matter.stringify(`# ${p.title}\n\n${p.content}\n`, fm), { mode: FILE_MODE });
+    let fm;
+    let body;
+    let oldContent = null;
+    if (fs.existsSync(pagePath)) {
+      try {
+        oldContent = fs.readFileSync(pagePath, 'utf8');
+      } catch {
+        oldContent = null;
+      }
+    }
+    if (oldContent !== null) {
+      ({ fm, body } = mergePageContent(oldContent, p, now));
+    } else {
+      fm = {
+        'hub-id': p.hubIds,
+        sources: p.sources,
+        'last-updated': now,
+        tags: p.tags,
+      };
+      body = `# ${p.title}\n\n${p.content}`;
+    }
+    atomicWrite(pagePath, matter.stringify(`${body}\n`, fm), { mode: FILE_MODE });
     for (const id of p.hubIds) {
       state.processed[id] = { page: p.slug, at: now };
     }

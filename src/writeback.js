@@ -20,7 +20,8 @@ import matter from 'gray-matter';
 import { loadConfig } from './config.js';
 import { storePaths } from './hub-store.js';
 import { atomicWrite } from './safe-write.js';
-import { FILE_MODE } from './util/paths.js';
+import { paths, FILE_MODE } from './util/paths.js';
+import { withLock } from './util/lock.js';
 import { createAdapters, ADAPTER_BATCHES } from './adapters/registry.js';
 
 /** 各 App「何时生效」说明（每条写回输出时附带） */
@@ -41,6 +42,16 @@ export function writebackLogPath() {
 }
 
 /**
+ * 全局写回锁路径：~/.memory-hub/state/write.lock（H2 修复）。
+ * daemon 与 CLI 的 runWriteback 真实写入段全部持此锁，
+ * 避免两个进程同时对同一 App 记忆文件做「读全文→合并→替换」互相吞内容。
+ * @returns {string}
+ */
+export function writeLockPath() {
+  return path.join(paths.state, 'write.lock');
+}
+
+/**
  * 读取写回日志（数组）；不存在/损坏时返回空数组。
  * @returns {Object[]}
  */
@@ -56,13 +67,16 @@ export function loadWritebackLog() {
 
 /**
  * 追加写回日志记录（原子写，600 权限）。
+ * H1：整个「读-追加-写」套跨进程锁，daemon 与 CLI 并发写回不再丢日志条目。
  * @param {Object[]} records { time, app, hubId, result, backupDir }[]
  */
 export function appendWritebackLog(records) {
   if (!Array.isArray(records) || records.length === 0) return;
-  const log = loadWritebackLog();
-  log.push(...records);
-  atomicWrite(writebackLogPath(), `${JSON.stringify(log, null, 2)}\n`, { mode: FILE_MODE });
+  withLock(writebackLogPath(), () => {
+    const log = loadWritebackLog();
+    log.push(...records);
+    atomicWrite(writebackLogPath(), `${JSON.stringify(log, null, 2)}\n`, { mode: FILE_MODE });
+  });
 }
 
 /** 去掉正文首个 `# 一级标题` 行（各 App 渲染时会自带标题，避免重复） */
@@ -286,23 +300,11 @@ export async function runWriteback(opts = {}) {
     };
   }
 
-  // 跨 App 并行、单 App 失败隔离熔断（Promise.allSettled）
-  const settled = await Promise.allSettled(
-    adapters.map((adapter) => runAppWriteback(adapter, entries, opts, config)),
-  );
-  const appResults = settled.map((s, i) => {
-    const adapter = adapters[i];
-    if (s.status === 'rejected') {
-      return {
-        app: adapter.id,
-        batch: ADAPTER_BATCHES[adapter.id] || 1,
-        status: 'failed',
-        error: s.reason?.message || String(s.reason),
-        entries: [],
-      };
-    }
-    return s.value;
-  });
+  // H2：真实写入段持全局跨进程写锁（state/write.lock，daemon 与 CLI 共用），
+  // 避免与 App/用户的并发写入在「读→合并→替换」间隙互相吞内容；dry-run 无写入不加锁。
+  const appResults = opts.dryRun
+    ? await doWritebackPass()
+    : await withLock(writeLockPath(), () => doWritebackPass());
 
   // 写回日志（dry-run 不记录）
   if (!opts.dryRun) {
@@ -342,6 +344,26 @@ export async function runWriteback(opts = {}) {
     appResults,
     logPath: opts.dryRun ? undefined : writebackLogPath(),
   };
+
+  /** 跨 App 并行、单 App 失败隔离熔断（Promise.allSettled） */
+  async function doWritebackPass() {
+    const settled = await Promise.allSettled(
+      adapters.map((adapter) => runAppWriteback(adapter, entries, opts, config)),
+    );
+    return settled.map((s, i) => {
+      const adapter = adapters[i];
+      if (s.status === 'rejected') {
+        return {
+          app: adapter.id,
+          batch: ADAPTER_BATCHES[adapter.id] || 1,
+          status: 'failed',
+          error: s.reason?.message || String(s.reason),
+          entries: [],
+        };
+      }
+      return s.value;
+    });
+  }
 }
 
 /**

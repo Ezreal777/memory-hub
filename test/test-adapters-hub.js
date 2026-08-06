@@ -401,7 +401,8 @@ test('sources 快照：文件头含来源元数据块（app/源路径/sha256）'
   assert.equal(snaps.length, 1);
   const snapContent = fs.readFileSync(path.join(snapDir, snaps[0]), 'utf8');
   assert.match(snapContent, /^---/, '以元数据块开头');
-  assert.match(snapContent, /app: claude/);
+  // H5：yamlScalar 一律 JSON.stringify 输出（保证任意标题/值均产出可解析 YAML）
+  assert.match(snapContent, /app: "claude"/);
   assert.match(snapContent, /source: /);
   assert.match(snapContent, /sha256: /);
   assert.match(snapContent, /快照正文/);

@@ -24,7 +24,7 @@ import {
   listDirFiles,
   slugify,
 } from './base.js';
-import { writeFilesSafely } from './write-utils.js';
+import { writeFilesSafely, statSafe } from './write-utils.js';
 
 /** 索引行匹配：`- [标题](目标.md) — 摘要`（分隔符兼容 — / – / -） */
 const INDEX_LINE_RE = /^\s*[-*]\s*\[([^\]]+)\]\(([^)]+)\)\s*[—–-]?\s*(.*)$/;
@@ -57,6 +57,16 @@ export class ClaudeAdapter extends BaseAdapter {
       files.push(...listDirFiles(dir, (name) => name.endsWith('.md')));
     }
     return files;
+  }
+
+  /** M1 摄取白名单：仅 memory 目录下的直接 .md 文件（防任意用户文档被摄取） */
+  isIngestible(filePath) {
+    if (!this.owns(filePath)) return false;
+    const resolved = path.resolve(filePath);
+    return (
+      path.basename(resolved).endsWith('.md') &&
+      this.memoryPaths.some((dir) => path.dirname(resolved) === path.resolve(dir))
+    );
   }
 
   parse(raw) {
@@ -155,7 +165,10 @@ export class ClaudeAdapter extends BaseAdapter {
 
   /**
    * 写回一组条目到 config memory_paths 的每个 memory 目录（双文件写入）。
-   * 幂等：条目文件已存在且含该 hub-id 标记 → 跳过（支持被覆盖后重放不重复）。
+   * 幂等：条目文件已存在且含该 hub-id 标记 → 跳过（支持被覆盖后重放不重复）；
+   * H2c 自愈：即便条目文件已含 hubId，也校验 MEMORY.md 是否含对应索引行，
+   * 缺则补写（索引行丢失后不再永久丢失，重放即可自愈）。
+   * H2b：写入前抓 mtime/size 守卫，读-写间隙被外部修改则记 deferred 下轮重试。
    * @param {Object[]} entries Entry[]
    * @returns {Promise<Object[]>} 逐条结果 { hubId, status, targets, backupDir }
    */
@@ -176,39 +189,84 @@ export class ClaudeAdapter extends BaseAdapter {
           n += 1;
         }
         const entryPath = path.join(dir, fileName);
+        const entryStat = statSafe(entryPath); // H2b：读取时 stat 守卫基准
 
-        // 幂等：条目文件已含 hub-id 标记 → 整体跳过
+        // 幂等：条目文件已含 hub-id 标记 → 跳过，但先校验索引行（H2c 自愈）
         if (entry.hubId && fs.existsSync(entryPath)) {
           const existing = fs.readFileSync(entryPath, 'utf8');
           if (existing.includes(entry.hubId)) {
+            const indexStat = statSafe(indexPath);
+            const indexContent = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
+            if (!indexContent.includes(`(${fileName})`)) {
+              // 索引行缺失：补写一行（绝不重写索引既有行），恢复重放自愈能力
+              const indexLine = this.renderIndexLine(entry, fileName);
+              const newIndexContent =
+                (indexContent ? indexContent.replace(/\s*$/, '\n') : '') + `${indexLine}\n`;
+              try {
+                const { backupDir } = writeFilesSafely([
+                  {
+                    path: indexPath,
+                    content: newIndexContent,
+                    verifyOpts: { expectMarker: indexLine },
+                    app: this.id,
+                    preStat: indexStat,
+                  },
+                ]);
+                results.push({
+                  hubId: entry.hubId,
+                  status: 'written',
+                  targets: [indexPath],
+                  backupDir,
+                  reason: '条目已存在，补写缺失的 MEMORY.md 索引行（自愈）',
+                });
+              } catch (err) {
+                if (err.deferred) {
+                  results.push({ hubId: entry.hubId, status: 'deferred', reason: err.message });
+                } else {
+                  throw err;
+                }
+              }
+              continue;
+            }
             results.push({ hubId: entry.hubId, status: 'skipped', targets: [entryPath], reason: '已含 hub-id 标记' });
             continue;
           }
         }
 
         const entryContent = this.render(entry);
+        const indexStat = statSafe(indexPath); // H2b：索引读前抓守卫（每条目重新抓，覆盖前一条目刚写入的情况）
         const existingIndex = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '';
         const indexLine = this.renderIndexLine(entry, fileName);
         const newIndexContent =
           (existingIndex ? existingIndex.replace(/\s*$/, '\n') : '') + `${indexLine}\n`;
 
-        // 备份 → registerInflight → 原子写 → verify（失败自动整体回滚）
-        const { backupDir } = writeFilesSafely([
-          {
-            path: entryPath,
-            content: entryContent,
-            verifyOpts: { expectFrontmatter: true, expectMarker: entry.hubId },
-            app: this.id,
-            hubId: entry.hubId,
-          },
-          {
-            path: indexPath,
-            content: newIndexContent,
-            verifyOpts: { expectMarker: indexLine },
-            app: this.id,
-          },
-        ]);
-        results.push({ hubId: entry.hubId, status: 'written', targets: [entryPath, indexPath], backupDir });
+        // 备份 → registerInflight → 原子写 → verify（失败自动整体回滚；外部并发修改记 deferred）
+        try {
+          const { backupDir } = writeFilesSafely([
+            {
+              path: entryPath,
+              content: entryContent,
+              verifyOpts: { expectFrontmatter: true, expectMarker: entry.hubId },
+              app: this.id,
+              hubId: entry.hubId,
+              preStat: entryStat,
+            },
+            {
+              path: indexPath,
+              content: newIndexContent,
+              verifyOpts: { expectMarker: indexLine },
+              app: this.id,
+              preStat: indexStat,
+            },
+          ]);
+          results.push({ hubId: entry.hubId, status: 'written', targets: [entryPath, indexPath], backupDir });
+        } catch (err) {
+          if (err.deferred) {
+            results.push({ hubId: entry.hubId, status: 'deferred', reason: err.message });
+          } else {
+            throw err;
+          }
+        }
       }
     }
     return results;

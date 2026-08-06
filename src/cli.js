@@ -38,11 +38,12 @@ import {
 } from './writeback.js';
 import {
   atomicWrite,
+  createBackupDir,
   latestBackupDir,
   listBackupDirs,
-  pruneBackups,
   rollback,
   MAX_BACKUPS,
+  MAX_FULL_BACKUPS,
 } from './safe-write.js';
 import {
   runDaemon,
@@ -86,7 +87,7 @@ program
 const keysCmd = program
   .command('keys')
   .description('管理 LLM API Key（macOS Keychain，输出一律脱敏）')
-  .option('--sync', '只读同步 Codex auth.json 与 shell rc 中的密钥到 Keychain')
+  .option('--sync', '只读同步密钥来源到 Keychain（codex-openai / idealab / claude-anthropic）')
   .action((opts) => {
     if (opts.sync) {
       let results;
@@ -103,7 +104,12 @@ const keysCmd = program
         return;
       }
       for (const r of results) {
-        console.log(`已同步 ${r.name}（来源: ${r.origin}，值: ${r.masked}）`);
+        // L4：覆盖既有条目时明确提示，绝不静默覆盖
+        console.log(
+          r.overwritten
+            ? `已覆盖既有条目 ${r.name}（来源: ${r.origin}，值: ${r.masked}）`
+            : `已同步 ${r.name}（来源: ${r.origin}，值: ${r.masked}）`,
+        );
       }
       console.log('提示: 用 hub keys use <name> 切换 config.llm.keyRef');
       return;
@@ -135,10 +141,18 @@ keysCmd
 
 keysCmd
   .command('use <name>')
-  .description('切换 config.llm.keyRef 指向指定 Keychain 条目')
-  .action((name) => {
-    useKey(name);
-    console.log(`已将 llm.keyRef 切换为 "${name}"`);
+  .description('切换 config.llm.keyRef 指向指定 Keychain 条目（可选一并配置 LLM 端点）')
+  // M5：补齐 init 引导承诺的 llm.baseUrl / llm.model 配置入口（新增选项，向后兼容）
+  .option('--base-url <url>', '同时落盘 config.llm.baseUrl（OpenAI 兼容端点）')
+  .option('--model <model>', '同时落盘 config.llm.model')
+  .action((name, opts) => {
+    useKey(name, { baseUrl: opts.baseUrl, model: opts.model });
+    const extra = [];
+    if (opts.baseUrl) extra.push(`llm.baseUrl=${opts.baseUrl}`);
+    if (opts.model) extra.push(`llm.model=${opts.model}`);
+    console.log(
+      `已将 llm.keyRef 切换为 "${name}"${extra.length > 0 ? `，并配置 ${extra.join('、')}` : ''}`,
+    );
   });
 
 // hub watch —— 前台监听全部已启用 App 的记忆目录，增量摄取到中转站（Ctrl-C 退出）
@@ -246,7 +260,8 @@ export function runInit() {
   console.log('');
   console.log('下一步指引：');
   console.log('  1. hub keys --sync        # 只读同步 LLM 密钥到 Keychain（distill 需要）');
-  console.log('  2. hub keys use <name>    # 切换 config.llm.keyRef，并补齐 llm.baseUrl/model');
+  console.log('  2. hub keys use <name> [--base-url <url>] [--model <model>]');
+  console.log('                            # 切换 config.llm.keyRef，并补齐 llm.baseUrl/model');
   console.log('  3. hub daemon install     # 安装 launchd 后台守护（开机自启 + 崩溃自拉起）');
   console.log('  4. hub status             # 随时查看一屏汇总状态');
 }
@@ -261,11 +276,6 @@ program
 // ---------------------------------------------------------------------------
 // hub backup —— 对全部已发现 app 的记忆文件做一次快照备份
 // ---------------------------------------------------------------------------
-
-/** 备份目录时间戳（与 safe-write 同风格，文件系统可排序） */
-function backupTimestamp() {
-  return new Date().toISOString().replace(/[:.]/g, '-');
-}
 
 /**
  * 收集单个 app 的记忆文件清单：memory_paths 中的文件直接收录，
@@ -311,14 +321,9 @@ export function collectMemoryFiles(appCfg) {
 export function backupAllApps(opts = {}) {
   const config = opts.config || loadConfig();
   ensureHubDirs();
-  // 同毫秒冲突兜底
-  let dir = path.join(paths.backups, backupTimestamp());
-  let n = 2;
-  while (fs.existsSync(dir)) {
-    dir = path.join(paths.backups, `${backupTimestamp()}-${n}`);
-    n += 1;
-  }
-  ensureDir(dir);
+  // M2：全量备份独立分池 backups/full/（与 writeback 每批备份池分离，各自限额，
+  // 互不挤出；createBackupDir 内含唯一时间戳目录创建与统一 prune）
+  const dir = createBackupDir('full');
 
   const manifest = {};
   let count = 0;
@@ -343,7 +348,6 @@ export function backupAllApps(opts = {}) {
   atomicWrite(path.join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, {
     mode: FILE_MODE,
   });
-  pruneBackups(); // 超出保留上限的旧备份自动清理
   return { dir, count, manifest };
 }
 
@@ -616,9 +620,11 @@ export function getStatusReport(opts = {}) {
   }
   lines.push('');
 
-  // 6. backups 现存份数
+  // 6. backups 现存份数（M2：全量与写回分池，各自限额）
   lines.push('【backups】');
-  lines.push(`  现存 ${listBackupDirs().length} 份（保留上限 ${MAX_BACKUPS}，目录: ${paths.backups}）`);
+  lines.push(
+    `  现存 ${listBackupDirs().length} 份（全量池上限 ${MAX_FULL_BACKUPS} / 写回池上限 ${MAX_BACKUPS}，目录: ${paths.backups}）`,
+  );
   return lines.join('\n');
 }
 

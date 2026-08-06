@@ -18,6 +18,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths, ensureDir, FILE_MODE } from './util/paths.js';
+// H1：inflight.json 的读-改写一律套跨进程锁，daemon 与 CLI 并发不再互相吞条目
+import { withLock } from './util/lock.js';
 
 /** 条目存活时长：超过该时长未被消费的条目视为过期自动清理（默认 10 分钟） */
 export const INFLIGHT_TTL_MS = 10 * 60 * 1000;
@@ -113,9 +115,12 @@ export function saveInflightEntries(entries, dirs) {
  * @param {string} expectedSha256 写入内容的 SHA-256
  */
 export function registerInflight(filePath, expectedSha256) {
-  const entries = loadInflightEntries();
-  entries[path.resolve(filePath)] = { sha256: expectedSha256, ts: Date.now() };
-  saveInflightEntries(entries);
+  const key = path.resolve(filePath);
+  withLock(inflightStorePath(), () => {
+    const entries = loadInflightEntries();
+    entries[key] = { sha256: expectedSha256, ts: Date.now() };
+    saveInflightEntries(entries);
+  });
 }
 
 /**
@@ -124,10 +129,12 @@ export function registerInflight(filePath, expectedSha256) {
  */
 export function clearInflight(filePath) {
   const key = path.resolve(filePath);
-  const { entries, dirs } = loadRaw();
-  if (!Object.prototype.hasOwnProperty.call(entries, key)) return;
-  delete entries[key];
-  saveInflightEntries(entries, dirs);
+  withLock(inflightStorePath(), () => {
+    const { entries, dirs } = loadRaw();
+    if (!Object.prototype.hasOwnProperty.call(entries, key)) return;
+    delete entries[key];
+    saveInflightEntries(entries, dirs);
+  });
 }
 
 /**
@@ -138,9 +145,12 @@ export function clearInflight(filePath) {
  * @param {number} [ttlMs] 窗口时长；缺省 DIR_WINDOW_TTL_MS（120 秒）
  */
 export function registerDirWindow(dir, ttlMs = DIR_WINDOW_TTL_MS) {
-  const { entries, dirs } = loadRaw();
-  dirs[path.resolve(dir)] = { ts: Date.now(), ttlMs };
-  saveInflightEntries(entries, dirs);
+  const key = path.resolve(dir);
+  withLock(inflightStorePath(), () => {
+    const { entries, dirs } = loadRaw();
+    dirs[key] = { ts: Date.now(), ttlMs };
+    saveInflightEntries(entries, dirs);
+  });
 }
 
 /**
@@ -157,19 +167,23 @@ export function registerDirWindow(dir, ttlMs = DIR_WINDOW_TTL_MS) {
  */
 export function consumeInflight(filePath, sha256) {
   const key = path.resolve(filePath);
-  const { entries, dirs } = loadRaw();
-  if (Object.prototype.hasOwnProperty.call(entries, key)) {
-    const expected = entries[key].sha256;
-    // 命中登记 → 消费并移除该条目；hash 匹配才算自写回环，不匹配视为外部改动正常处理
-    delete entries[key];
-    saveInflightEntries(entries, dirs);
-    if (expected === sha256) return { match: 'exact' };
-  }
-  // 目录级宽限窗口：窗口内该目录下任何文件事件一律抑制（覆盖客户端改名/重写）
-  for (const [dir] of Object.entries(dirs)) {
-    if (key === dir || key.startsWith(`${dir}${path.sep}`)) {
-      return { match: 'dirWindow', dir };
+  return withLock(inflightStorePath(), () => {
+    const { entries, dirs } = loadRaw();
+    if (Object.prototype.hasOwnProperty.call(entries, key)) {
+      const expected = entries[key].sha256;
+      // 命中登记 → 消费并移除该条目；hash 匹配才算自写回环，不匹配视为外部改动正常处理
+      delete entries[key];
+      saveInflightEntries(entries, dirs);
+      if (expected === sha256) return { match: 'exact' };
     }
-  }
-  return null;
+    // 目录级宽限窗口：窗口内该目录下任何文件事件一律抑制（覆盖客户端改名/重写）。
+    // 注意（M3）：dirWindow 命中只丢弃事件，调用方绝不因此记录对账指纹，
+    // 否则窗口期内的真实外部修改会被永久漏摄取（窗口过期后由轮询对账兜底）。
+    for (const [dir] of Object.entries(dirs)) {
+      if (key === dir || key.startsWith(`${dir}${path.sep}`)) {
+        return { match: 'dirWindow', dir };
+      }
+    }
+    return null;
+  });
 }

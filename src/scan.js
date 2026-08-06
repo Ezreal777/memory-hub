@@ -192,11 +192,17 @@ export function scanApps(opts = {}) {
       result = { found: false, memory_paths: [], project_slug: '', notes: `探测异常: ${err.message}` };
     }
 
+    // L7：写回 notes 时保留既有 readOnly 标注（否则重扫会把只读标记冲掉）
+    let notes = result.found ? result.notes : '未找到';
+    if (/read[-_ ]?only/i.test(String(app.notes || '')) && !/read[-_ ]?only/i.test(notes)) {
+      notes = `${notes} | readOnly`;
+    }
+
     updateApp(app.id, {
       enabled: result.found, // 未找到 → 禁用；找到 → 重新启用
       memory_paths: result.memory_paths,
       project_slug: result.project_slug,
-      notes: result.found ? result.notes : '未找到',
+      notes,
     });
 
     rows.push({ id: app.id, ...result });

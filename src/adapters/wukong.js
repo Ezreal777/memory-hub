@@ -20,7 +20,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { BaseAdapter, makeEntry, isIgnoredPath } from './base.js';
 import { splitH2Sections } from './codex.js';
-import { writeFilesSafely } from './write-utils.js';
+import { statSafe, writeFilesSafely } from './write-utils.js';
 
 /** 需要摄取的顶层文件名 */
 const TOP_FILES = ['MEMORY.md', 'USER.md', 'SOUL.md'];
@@ -111,6 +111,15 @@ export class WukongAdapter extends BaseAdapter {
     return files;
   }
 
+  /** M1 摄取白名单：仅 workspace 顶层的 MEMORY.md / USER.md / SOUL.md（防任意非隐藏文件被摄取） */
+  isIngestible(filePath) {
+    if (!this.owns(filePath)) return false;
+    const resolved = path.resolve(filePath);
+    return this.memoryPaths.some(
+      (dir) => path.dirname(resolved) === path.resolve(dir) && TOP_FILES.includes(path.basename(resolved)),
+    );
+  }
+
   parse(raw) {
     const sections = splitH2Sections(raw.content);
     return sections.map((sec) =>
@@ -190,6 +199,8 @@ export class WukongAdapter extends BaseAdapter {
         continue;
       }
 
+      // H2b：读取前抓取 mtime/size 快照，写前二次比对，防云端同步/用户并发写入被覆盖
+      const preStat = statSafe(memPath);
       const existing = fs.existsSync(memPath) ? fs.readFileSync(memPath, 'utf8') : '';
       const pending = [];
       const sections = [];
@@ -207,16 +218,27 @@ export class WukongAdapter extends BaseAdapter {
       const head = existing && !existing.endsWith('\n') ? `${existing}\n` : existing;
       const newContent = `${head}\n${sections.join('\n\n')}\n`;
 
-      const { backupDir } = writeFilesSafely([
-        {
-          path: memPath,
-          content: newContent,
-          verifyOpts: { expectMarker: pending.map((e) => `[${e.hubId}]`) },
-          app: this.id,
-        },
-      ]);
-      for (const entry of pending) {
-        results.push({ hubId: entry.hubId, status: 'written', targets: [memPath], backupDir, note: WUKONG_WRITE_NOTE });
+      try {
+        const { backupDir } = writeFilesSafely([
+          {
+            path: memPath,
+            content: newContent,
+            preStat,
+            verifyOpts: { expectMarker: pending.map((e) => `[${e.hubId}]`) },
+            app: this.id,
+          },
+        ]);
+        for (const entry of pending) {
+          results.push({ hubId: entry.hubId, status: 'written', targets: [memPath], backupDir, note: WUKONG_WRITE_NOTE });
+        }
+      } catch (err) {
+        if (err.deferred) {
+          for (const entry of pending) {
+            results.push({ hubId: entry.hubId, status: 'deferred', targets: [memPath], reason: `目标文件读写间隙被外部修改（${err.message}），放弃本轮稍后重试` });
+          }
+          continue;
+        }
+        throw err;
       }
     }
     return results;

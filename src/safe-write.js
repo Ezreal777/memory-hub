@@ -16,8 +16,23 @@ import crypto from 'node:crypto';
 import matter from 'gray-matter';
 import { paths, ensureDir, ensureHubDirs, FILE_MODE } from './util/paths.js';
 
-/** 备份保留份数：仅保留最近 N 个备份目录，更早的自动清理 */
+/**
+ * 备份保留策略（M2 修复：分池，全量与写回不再共用一个保留池）：
+ * - backups/full/：hub backup 全量快照，保留最近 MAX_FULL_BACKUPS 份；
+ * - backups/writeback/：写回每批备份，保留最近 MAX_BACKUPS 份；
+ * - backups/ 根下的历史遗留目录（旧版单池）：随 listBackupDirs 仍可发现/回滚，
+ *   并在写入时按 MAX_BACKUPS 限额逐步淘汰。
+ */
 export const MAX_BACKUPS = 20;
+export const MAX_FULL_BACKUPS = 10;
+
+/** 备份池名 */
+export const BACKUP_POOLS = ['full', 'writeback'];
+
+/** 备份池根目录（full/writeback） */
+export function backupPoolDir(pool) {
+  return path.join(paths.backups, pool);
+}
 
 /** 备份目录内的清单文件名：记录每个备份条目对应的原路径与备份时是否已存在 */
 export const MANIFEST_NAME = 'manifest.json';
@@ -58,26 +73,72 @@ function backupTimestamp() {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
-/**
- * 列出所有备份目录（按目录名升序，ISO 时间戳可按字典序排序）。
- * @returns {string[]} 备份目录绝对路径数组（旧 → 新）
- */
-export function listBackupDirs() {
-  if (!fs.existsSync(paths.backups)) return [];
+/** 列出单个目录下的备份子目录（按目录名升序） */
+function listDirsIn(root) {
+  if (!fs.existsSync(root)) return [];
   return fs
-    .readdirSync(paths.backups, { withFileTypes: true })
+    .readdirSync(root, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name)
     .sort()
-    .map((name) => path.join(paths.backups, name));
+    .map((name) => path.join(root, name));
 }
 
 /**
- * 清理过期备份：仅保留最近 MAX_BACKUPS 个备份目录。
+ * 列出全部备份目录（full 池 + writeback 池 + 历史遗留顶层目录，按时间戳名升序）。
+ * @returns {string[]} 备份目录绝对路径数组（旧 → 新）
+ */
+export function listBackupDirs() {
+  const dirs = [
+    ...listDirsIn(backupPoolDir('full')),
+    ...listDirsIn(backupPoolDir('writeback')),
+  ];
+  // 历史遗留：backups/ 根下的旧备份目录（排除两个池目录本身）
+  if (fs.existsSync(paths.backups)) {
+    for (const d of fs.readdirSync(paths.backups, { withFileTypes: true })) {
+      if (!d.isDirectory() || BACKUP_POOLS.includes(d.name)) continue;
+      dirs.push(path.join(paths.backups, d.name));
+    }
+  }
+  return dirs.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+}
+
+/** 限额裁剪单个池（或遗留顶层）；limit<=0 时清空 */
+function pruneDirTo(root, limit) {
+  const dirs = listDirsIn(root);
+  const removed = [];
+  const keep = Math.max(0, limit);
+  if (dirs.length > keep) {
+    for (const dir of dirs.slice(0, dirs.length - keep)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      removed.push(dir);
+    }
+  }
+  return removed;
+}
+
+/**
+ * 清理过期备份（M2 分池限额：full 保留 10 份、writeback 保留 20 份，
+ * 历史遗留顶层目录按 writeback 限额逐步淘汰）。
  * @returns {string[]} 被删除的目录路径
  */
 export function pruneBackups() {
-  const dirs = listBackupDirs();
+  return [
+    ...pruneDirTo(backupPoolDir('full'), MAX_FULL_BACKUPS),
+    ...pruneDirTo(backupPoolDir('writeback'), MAX_BACKUPS),
+    ...pruneLegacyTopLevel(),
+  ];
+}
+
+/** 历史遗留顶层目录裁剪（不删两个池目录本身） */
+function pruneLegacyTopLevel() {
+  if (!fs.existsSync(paths.backups)) return [];
+  const dirs = fs
+    .readdirSync(paths.backups, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && !BACKUP_POOLS.includes(d.name))
+    .map((d) => d.name)
+    .sort()
+    .map((name) => path.join(paths.backups, name));
   const removed = [];
   if (dirs.length > MAX_BACKUPS) {
     for (const dir of dirs.slice(0, dirs.length - MAX_BACKUPS)) {
@@ -89,22 +150,35 @@ export function pruneBackups() {
 }
 
 /**
- * 备份单个文件到「新建的」备份目录。
+ * 在指定备份池中新建唯一时间戳目录，并统一执行该池的限额裁剪（L2 修复）。
+ * @param {'full'|'writeback'} [pool] 缺省 writeback
+ * @returns {string} 新备份目录绝对路径
+ */
+export function createBackupDir(pool = 'writeback') {
+  ensureHubDirs();
+  const root = backupPoolDir(pool);
+  ensureDir(root);
+  const ts = backupTimestamp();
+  let dir = path.join(root, ts);
+  let n = 2;
+  while (fs.existsSync(dir)) {
+    dir = path.join(root, `${ts}-${n}`);
+    n += 1;
+  }
+  ensureDir(dir);
+  pruneBackups(); // L2：无论后续是否真有文件备份，限额裁剪统一在此执行
+  return dir;
+}
+
+/**
+ * 备份单个文件到「新建的」备份目录（writeback 池）。
  * 目标文件不存在时不报错，返回 null（用于首次写入场景）。
  * @param {string} filePath 被备份文件的绝对路径
  * @returns {string|null} 备份后的文件路径；源文件不存在时返回 null
  */
 export function backup(filePath) {
   if (!fs.existsSync(filePath)) return null;
-  ensureHubDirs();
-  // 同一毫秒内多次备份时避免目录名冲突
-  let dir = path.join(paths.backups, backupTimestamp());
-  let n = 2;
-  while (fs.existsSync(dir)) {
-    dir = path.join(paths.backups, `${backupTimestamp()}-${n}`);
-    n += 1;
-  }
-  return backupTo(filePath, dir);
+  return backupTo(filePath, createBackupDir('writeback'));
 }
 
 /**
@@ -142,17 +216,22 @@ export function backupTo(filePath, dir, extra = {}) {
   fs.copyFileSync(filePath, dest);
   fs.chmodSync(dest, FILE_MODE);
   mergeManifestEntry(dir, name, { origin: filePath, existed: true, ...extraFields });
-  pruneBackups();
+  // L2：prune 已统一移入 createBackupDir，纯新增文件分支不再遗漏清理
   return dest;
 }
 
 /**
- * 获取最近一次备份目录。
+ * 获取最近一次备份目录（M2：缺省优先 full 池最新——全量恢复点最全，
+ * full 池为空时回退 writeback 池，再回退历史遗留顶层目录）。
  * @returns {string|null} 最新备份目录路径；无备份时返回 null
  */
 export function latestBackupDir() {
-  const dirs = listBackupDirs();
-  return dirs.length ? dirs[dirs.length - 1] : null;
+  for (const pool of ['full', 'writeback']) {
+    const dirs = listDirsIn(backupPoolDir(pool));
+    if (dirs.length > 0) return dirs[dirs.length - 1];
+  }
+  const legacy = listBackupDirs();
+  return legacy.length ? legacy[legacy.length - 1] : null;
 }
 
 /**

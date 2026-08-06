@@ -20,10 +20,11 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { paths, ensureHubDirs, ensureDir, FILE_MODE } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
-import { loadConfig } from './config.js';
+import { loadConfig, defaultConfig } from './config.js';
 import { Watcher } from './watcher.js';
 import { distill } from './distill.js';
 import { runWriteback, wikiToEntries } from './writeback.js';
+import { appendLogEntry, rotateLogFile } from './util/log.js';
 
 /** launchd 服务标签 */
 export const LAUNCHD_LABEL = 'com.kuangju.memory-hub';
@@ -33,6 +34,15 @@ export const DISTILL_INTERVAL_MS = 5 * 60 * 1000;
 /** writeback 轮询间隔：10 分钟 */
 export const WRITEBACK_INTERVAL_MS = 10 * 60 * 1000;
 
+/** H3：连续启动失败上限，超过后主动 bootout 自身，终止 KeepAlive 重启风暴 */
+export const CRASH_LIMIT = 5;
+
+/** M8：一切外部子进程（security/launchctl/which）统一超时 10s + SIGKILL 兜底 */
+export const SUBPROCESS_TIMEOUT_MS = 10 * 1000;
+
+/** 统一的子进程 spawnSync 选项（超时 + killSignal，失败由调用方降级） */
+export const SUBPROCESS_OPTS = { encoding: 'utf8', timeout: SUBPROCESS_TIMEOUT_MS, killSignal: 'SIGKILL' };
+
 /** daemon 日志文件路径 */
 export function daemonLogPath() {
   return path.join(paths.logs, 'daemon.log');
@@ -40,16 +50,12 @@ export function daemonLogPath() {
 
 /**
  * 追加一条 daemon 日志（ISO 时间 + 级别 + 消息）。日志失败不影响主流程。
+ * L1：统一走 appendLogEntry（超 5MB 自动滚动，保留最近 3 份）。
  * @param {string} level info / warn / error
  * @param {string} msg 日志内容（绝不包含密钥）
  */
 export function logDaemon(level, msg) {
-  try {
-    ensureDir(paths.logs);
-    fs.appendFileSync(daemonLogPath(), `${new Date().toISOString()}\t${level}\t${msg}\n`);
-  } catch {
-    // 日志失败静默
-  }
+  appendLogEntry(daemonLogPath(), `${new Date().toISOString()}\t${level}\t${msg}`);
 }
 
 /**
@@ -153,7 +159,7 @@ export function defaultPlistPath() {
  * @throws {Error} 未找到 node 时抛出
  */
 export function resolveNodePath() {
-  const r = spawnSync('which', ['node'], { encoding: 'utf8' });
+  const r = spawnSync('which', ['node'], SUBPROCESS_OPTS); // M8：timeout 兜底
   const candidate = String(r.stdout || '').trim().split('\n')[0];
   if (!candidate) {
     throw new Error('resolveNodePath 失败：which node 未返回任何结果');
@@ -228,9 +234,9 @@ export function buildPlist(opts = {}) {
 // launchctl 封装（runner 可注入，测试用桩替代，绝不真正 bootstrap）
 // ---------------------------------------------------------------------------
 
-/** 缺省 launchctl 执行器（spawnSync，返回 { status, stdout, stderr }） */
+/** 缺省 launchctl 执行器（spawnSync，返回 { status, stdout, stderr }；M8：timeout 兜底） */
 function defaultLaunchctl(args) {
-  return spawnSync('launchctl', args, { encoding: 'utf8' });
+  return spawnSync('launchctl', args, SUBPROCESS_OPTS);
 }
 
 /** 取 uid（注入优先，便于测试） */
@@ -296,10 +302,25 @@ export function uninstallDaemon(opts = {}) {
 
 /**
  * 启动 daemon（kickstart，回退 launchctl start）。
+ * H3：启动前校验 plist 内的 node 可执行路径仍存在，失效时给出可读错误与修复指引。
  * @param {Object} [opts] launchctl/uid 可注入
  * @returns {{ via: string }}
  */
 export function startDaemon(opts = {}) {
+  // H3：plist 内 node 路径失效（升级/删除 node）时给出可读日志而非 launchd 无声重试
+  const plistPath = opts.plistPath || defaultPlistPath();
+  try {
+    const plist = fs.readFileSync(plistPath, 'utf8');
+    const m = plist.match(/<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]+)<\/string>/);
+    const nodePath = m?.[1];
+    if (nodePath && !fs.existsSync(nodePath)) {
+      throw new Error(
+        `plist 中的 node 可执行路径已失效: ${nodePath}。请先修复 node 安装，再执行 hub daemon install 重新生成 plist`,
+      );
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err; // plist 不存在时交给 launchctl 报错
+  }
   const run = opts.launchctl || defaultLaunchctl;
   const uid = uidOf(opts);
   const kick = run(['kickstart', `gui/${uid}/${LAUNCHD_LABEL}`]);
@@ -400,6 +421,88 @@ export function formatDaemonStatus(opts = {}) {
 // daemon 主循环
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// H3：启动失败计数（防 KeepAlive 重启风暴）
+// ---------------------------------------------------------------------------
+
+/** 连续启动失败计数文件：state/crash-count.json */
+export function crashCountPath() {
+  return path.join(paths.state, 'crash-count.json');
+}
+
+/**
+ * 递增启动失败计数并返回新值（文件损坏视为 0 起步）。
+ * @returns {number}
+ */
+export function bumpCrashCount() {
+  let n = 0;
+  try {
+    const raw = JSON.parse(fs.readFileSync(crashCountPath(), 'utf8'));
+    n = Number.isFinite(raw?.count) ? raw.count : 0;
+  } catch {
+    // 首次或损坏：从 0 计
+  }
+  n += 1;
+  try {
+    ensureDir(paths.state);
+    atomicWrite(crashCountPath(), `${JSON.stringify({ count: n, at: new Date().toISOString() })}\n`, { mode: FILE_MODE });
+  } catch {
+    // 计数落盘失败不阻塞启动
+  }
+  return n;
+}
+
+/** 重置启动失败计数（watcher 就绪即视为启动成功）。 */
+export function resetCrashCount() {
+  fs.rmSync(crashCountPath(), { force: true });
+}
+
+/**
+ * L5：清扫监听目录下陈旧的安全写入临时文件（`*.tmp-<pid>-<ts>`）。
+ * 仅清理自身模式且（持锁 pid 已死或文件龄超 1 小时）的文件，绝不误删活跃写入。
+ * @param {string[]} dirs 待清扫目录（各适配器 watchPaths）
+ * @returns {number} 清理文件数
+ */
+export function sweepStaleTmpFiles(dirs) {
+  const TMP_RE = /\.tmp-(\d+)-(\d+)$/;
+  const now = Date.now();
+  let removed = 0;
+  const stack = [...dirs.map((d) => path.resolve(d))];
+  const seen = new Set();
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      const m = e.name.match(TMP_RE);
+      if (!m) continue;
+      try {
+        const st = fs.statSync(full);
+        const staleByAge = now - st.mtimeMs > 60 * 60 * 1000;
+        const staleByPid = !isPidAlive(Number(m[1]));
+        if (staleByAge || staleByPid) {
+          fs.rmSync(full, { force: true });
+          removed += 1;
+        }
+      } catch {
+        // 恰好被删：跳过
+      }
+    }
+  }
+  return removed;
+}
+
 /**
  * daemon 主循环（hub daemon run 的前台进程体，由 launchd 拉起）。
  *
@@ -418,8 +521,35 @@ export function formatDaemonStatus(opts = {}) {
  * @throws {Error} pid 锁被存活进程占用时抛出
  */
 export async function runDaemon(opts = {}) {
-  const config = opts.config || loadConfig();
+  // H3：config 损坏时降级 defaultConfig 并记 error，绝不在入口抛出
+  // （否则 KeepAlive + ThrottleInterval 30s 会形成崩溃重启风暴）
+  let config = opts.config;
+  if (!config) {
+    try {
+      config = loadConfig();
+    } catch (err) {
+      config = defaultConfig();
+      logDaemon('error', `config.json 加载失败，降级使用缺省配置: ${err.message}（请修复 ~/.memory-hub/config.json）`);
+    }
+  }
   ensureHubDirs();
+
+  // H3：启动失败计数；超过 CRASH_LIMIT 主动 bootout 自身并留下明确日志，
+  // 终止 KeepAlive 无限重启风暴（而非每 30 秒刷一次 err 日志）
+  const crashN = bumpCrashCount();
+  if (crashN > CRASH_LIMIT) {
+    logDaemon('error', `连续 ${crashN} 次启动失败（上限 ${CRASH_LIMIT}），主动 bootout 自身终止重启风暴。请检查 logs/launchd.err.log 与 config.json 后重新 hub daemon install`);
+    try {
+      defaultLaunchctl(['bootout', `gui/${process.getuid?.() ?? 501}/${LAUNCHD_LABEL}`]);
+    } catch {
+      // bootout 失败不阻塞退出
+    }
+    process.exit(1);
+  }
+
+  // L1：launchd.out/err.log 由 launchd 直接追加无法拦截，启动时做一次同策略轮转
+  rotateLogFile(path.join(paths.logs, 'launchd.out.log'));
+  rotateLogFile(path.join(paths.logs, 'launchd.err.log'));
 
   // 1. pid O_EXCL 锁：存在且进程活着则抛错（cli 层转 exit 1）
   acquirePidLock();
@@ -437,11 +567,26 @@ export async function runDaemon(opts = {}) {
   const watchPaths = watcher.allWatchPaths();
   logDaemon('info', `watcher 监听 ${watchPaths.length} 个路径: ${watchPaths.join(' ; ') || '（无）'}`);
 
+  // L5：启动时清扫 kill -9 遗留的陈旧 .tmp-* 安全写入临时文件
+  try {
+    const swept = sweepStaleTmpFiles(watchPaths);
+    if (swept > 0) logDaemon('info', `已清扫 ${swept} 个陈旧临时文件（.tmp-*）`);
+  } catch (err) {
+    logDaemon('warn', `陈旧临时文件清扫异常: ${err.message}`);
+  }
+
   let stopping = false;
 
   // 3. 定时 distill（静默批量；LLM 未配置/调用失败优雅降级，只记录不重试风暴）
+  // M7：busy 标志防两轮重叠（重叠轮次跳过并记日志）
+  let distillBusy = false;
   const distillTimer = setInterval(async () => {
     if (stopping) return;
+    if (distillBusy) {
+      logDaemon('warn', 'distill 上一轮仍在进行，跳过本轮');
+      return;
+    }
+    distillBusy = true;
     try {
       const r = await distillFn({ config });
       if (!r.ok) {
@@ -452,12 +597,21 @@ export async function runDaemon(opts = {}) {
       // pending === 0 时无事发生，不打扰日志
     } catch (err) {
       logDaemon('error', `distill 异常: ${err.message}`);
+    } finally {
+      distillBusy = false;
     }
   }, distillMs);
 
   // 4. 定时 writeback（仅当 wiki 有条目；绝不传 forceBatch3，遵守 batch3Enabled 门禁）
+  // M7：busy 标志防两轮重叠
+  let writebackBusy = false;
   const writebackTimer = setInterval(async () => {
     if (stopping) return;
+    if (writebackBusy) {
+      logDaemon('warn', 'writeback 上一轮仍在进行，跳过本轮');
+      return;
+    }
+    writebackBusy = true;
     try {
       const entries = wikiToEntries();
       if (entries.length === 0) return; // wiki 无条目，不触发写回
@@ -468,6 +622,8 @@ export async function runDaemon(opts = {}) {
       logDaemon('info', `writeback 完成: ${entries.length} 条目（${summary || '无适配器'}）`);
     } catch (err) {
       logDaemon('error', `writeback 异常: ${err.message}`);
+    } finally {
+      writebackBusy = false;
     }
   }, writebackMs);
 
@@ -493,6 +649,8 @@ export async function runDaemon(opts = {}) {
   process.on('SIGTERM', onSigterm);
 
   await watcher.whenReady();
+  // H3：watcher 就绪即视为启动成功，重置连续失败计数
+  resetCrashCount();
   logDaemon('info', 'watcher 就绪，daemon 进入常驻循环');
 
   return {

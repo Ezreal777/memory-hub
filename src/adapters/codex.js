@@ -16,7 +16,7 @@
 
 import fs from 'node:fs';
 import { BaseAdapter, makeEntry } from './base.js';
-import { writeFilesSafely } from './write-utils.js';
+import { writeFilesSafely, statSafe } from './write-utils.js';
 
 /** 标记区开始注释 */
 export const HUB_MARK_START = '<!-- memory-hub:start -->';
@@ -178,12 +178,14 @@ export class CodexAdapter extends BaseAdapter {
   /**
    * 写回一组条目到 config 中每个 AGENTS.md（标记区整区重写）。
    * 幂等：合并后内容与原文完全一致 → 跳过（重放不产生任何写入）。
+   * H2b：读取时抓 mtime/size 守卫，写前二次 stat 不一致则记 deferred（下轮重试）。
    * @param {Object[]} entries Entry[]
    * @returns {Promise<Object[]>} 逐目标结果
    */
   async write(entries) {
     const results = [];
     for (const agentsPath of this.memoryPaths) {
+      const preStat = statSafe(agentsPath); // H2b：读取时 stat 守卫基准
       const original = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : '';
       const merged = this.buildMergedContent(original, entries);
       if (merged === original) {
@@ -195,18 +197,30 @@ export class CodexAdapter extends BaseAdapter {
         });
         continue;
       }
-      const { backupDir } = writeFilesSafely([
-        {
-          path: agentsPath,
-          content: merged,
-          verifyOpts: {
-            expectMarker: [HUB_MARK_START, HUB_MARK_END, ...entries.map((e) => `[${e.hubId}]`)],
+      try {
+        const { backupDir } = writeFilesSafely([
+          {
+            path: agentsPath,
+            content: merged,
+            verifyOpts: {
+              expectMarker: [HUB_MARK_START, HUB_MARK_END, ...entries.map((e) => `[${e.hubId}]`)],
+            },
+            app: this.id,
+            preStat,
           },
-          app: this.id,
-        },
-      ]);
-      for (const entry of entries) {
-        results.push({ hubId: entry.hubId, status: 'written', targets: [agentsPath], backupDir });
+        ]);
+        for (const entry of entries) {
+          results.push({ hubId: entry.hubId, status: 'written', targets: [agentsPath], backupDir });
+        }
+      } catch (err) {
+        if (err.deferred) {
+          // H2b：读-写间隙被 App/用户追加过内容 → 放弃本轮，下轮基于新内容重合并
+          for (const entry of entries) {
+            results.push({ hubId: entry.hubId, status: 'deferred', targets: [agentsPath], reason: err.message });
+          }
+        } else {
+          throw err;
+        }
       }
     }
     return results;

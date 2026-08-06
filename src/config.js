@@ -10,6 +10,8 @@
 import fs from 'node:fs';
 import { paths, ensureHubDirs, FILE_MODE } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
+// H1：config.json 的读-改写（updateApp/updateConfig）一律套跨进程锁，并发写不再丢更新
+import { withLock } from './util/lock.js';
 
 /** 5 个受管 App 的固定 id */
 export const APP_IDS = ['claude', 'codex', 'qoder', 'qoderwork', 'wukong'];
@@ -18,6 +20,7 @@ export const APP_IDS = ['claude', 'codex', 'qoder', 'qoderwork', 'wukong'];
  * 生成默认配置对象。
  * memory_paths 留空数组，待后续 scan 模块回填；
  * writeback.batch3Enabled 为高风险批次，默认关闭。
+ * L6：移除了无人消费的死配置 hubRoot（中转站路径一律由 MEMORY_HUB_ROOT 环境变量控制，见 README）。
  * @returns {Object} 默认配置
  */
 export function defaultConfig() {
@@ -32,7 +35,6 @@ export function defaultConfig() {
     llm: { baseUrl: '', model: '', keyRef: '' },
     debounceMs: 2000,
     pollIntervalMs: 60000,
-    hubRoot: '~/.memory-hub/hub',
     writeback: { batch3Enabled: false },
   };
 }
@@ -95,14 +97,17 @@ export function loadConfig() {
  * @throws {Error} appId 不存在时抛出
  */
 export function updateApp(appId, patch) {
-  const config = loadConfig();
-  const app = config.apps.find((a) => a.id === appId);
-  if (!app) {
-    throw new Error(`updateApp 失败：未知 app id "${appId}"`);
-  }
-  Object.assign(app, patch, { id: app.id }); // id 不允许被覆盖
-  saveConfig(config);
-  return config;
+  // H1：整个「读-改-写」置于锁内，daemon/CLI/scan 并发不再互相覆盖
+  return withLock(paths.config, () => {
+    const config = loadConfig();
+    const app = config.apps.find((a) => a.id === appId);
+    if (!app) {
+      throw new Error(`updateApp 失败：未知 app id "${appId}"`);
+    }
+    Object.assign(app, patch, { id: app.id }); // id 不允许被覆盖
+    saveConfig(config);
+    return config;
+  });
 }
 
 /**
@@ -111,10 +116,13 @@ export function updateApp(appId, patch) {
  * @returns {Object} 更新后的完整配置
  */
 export function updateConfig(patch = {}) {
-  const config = loadConfig();
-  const merged = { ...config, ...patch };
-  if (patch.llm) merged.llm = { ...config.llm, ...patch.llm };
-  if (patch.writeback) merged.writeback = { ...config.writeback, ...patch.writeback };
-  saveConfig(merged);
-  return merged;
+  // H1：整个「读-改-写」置于锁内
+  return withLock(paths.config, () => {
+    const config = loadConfig();
+    const merged = { ...config, ...patch };
+    if (patch.llm) merged.llm = { ...config.llm, ...patch.llm };
+    if (patch.writeback) merged.writeback = { ...config.writeback, ...patch.writeback };
+    saveConfig(merged);
+    return merged;
+  });
 }

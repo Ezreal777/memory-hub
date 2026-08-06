@@ -22,7 +22,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import matter from 'gray-matter';
 import { BaseAdapter, makeEntry, isIgnoredPath, slugify, listDirFiles } from './base.js';
-import { writeFilesSafely } from './write-utils.js';
+import { statSafe, writeFilesSafely } from './write-utils.js';
 
 /** 写回 frontmatter 必备四字段（缺一拒写） */
 export const REQUIRED_FIELDS = ['title', 'usage_scenario', 'keywords', 'source'];
@@ -63,6 +63,24 @@ export class QoderAdapter extends BaseAdapter {
       }
     }
     return files;
+  }
+
+  /** M1 摄取白名单：仅 projects/<slug>/<category>/*.md（与 discover 同构，防任意用户文档被摄取） */
+  isIngestible(filePath) {
+    if (!this.owns(filePath)) return false;
+    const resolved = path.resolve(filePath);
+    return this.memoryPaths.some((root) => {
+      const rel = path.relative(path.resolve(root), resolved);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+      const parts = rel.split(path.sep);
+      return (
+        parts.length === 4 &&
+        parts[0] === 'projects' &&
+        parts[1] !== '' &&
+        parts[2] !== '' &&
+        parts[3].endsWith('.md')
+      );
+    });
   }
 
   parse(raw) {
@@ -111,12 +129,15 @@ export class QoderAdapter extends BaseAdapter {
 
   /**
    * 由 entry 元数据映射 category，缺省 project_introduction。
+   * L3：校验合法字符集（防 `../` 路径穿越），非法回退 project_introduction。
    * @param {Object} entry Entry
    * @returns {string}
    */
   categoryOf(entry) {
     const c = entry.frontmatter?.category || entry.category;
-    return typeof c === 'string' && c.trim() ? c.trim() : 'project_introduction';
+    const trimmed = typeof c === 'string' ? c.trim() : '';
+    if (trimmed && /^[A-Za-z0-9_-]+$/.test(trimmed)) return trimmed;
+    return 'project_introduction';
   }
 
   /**
@@ -190,20 +211,32 @@ export class QoderAdapter extends BaseAdapter {
 
         const fileName = `${slugify(entry.title || entry.hubId)}.md`;
         const target = path.join(dir, fileName);
+        // H2b：撞名时目标文件可能已存在，写前二次比对 mtime/size 防并发覆盖
+        const preStat = statSafe(target);
         // N1：Qoder 客户端会在写回后 ~1 秒改名并重写 frontmatter（路径/hash 双变），
         // 除精确 inflight 登记外额外登记目录级宽限窗口（120s），窗口内该目录事件一律抑制
-        const { backupDir } = writeFilesSafely(
-          [
-            {
-              path: target,
-              content,
-              verifyOpts: { expectFrontmatter: REQUIRED_FIELDS, expectMarker: `[${entry.hubId}]` },
-              app: this.id,
-              hubId: entry.hubId,
-            },
-          ],
-          { dirWindows: [dir] },
-        );
+        let backupDir;
+        try {
+          ({ backupDir } = writeFilesSafely(
+            [
+              {
+                path: target,
+                content,
+                preStat,
+                verifyOpts: { expectFrontmatter: REQUIRED_FIELDS, expectMarker: `[${entry.hubId}]` },
+                app: this.id,
+                hubId: entry.hubId,
+              },
+            ],
+            { dirWindows: [dir] },
+          ));
+        } catch (err) {
+          if (err.deferred) {
+            results.push({ hubId: entry.hubId, status: 'deferred', targets: [target], reason: `目标文件读写间隙被外部修改（${err.message}），放弃本轮稍后重试` });
+            continue;
+          }
+          throw err;
+        }
         results.push({ hubId: entry.hubId, status: 'written', targets: [target], backupDir, note: QODER_WRITE_NOTE });
       }
     }

@@ -17,6 +17,8 @@ import { paths, ensureDir, FILE_MODE } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
 import { slugify, sha256Of } from './adapters/base.js';
 import { consumeInflight } from './inflight.js';
+// H1：hash-state.json 的读-改写一律套跨进程锁，并发摄取不再丢指纹
+import { withLock } from './util/lock.js';
 
 /**
  * 中转站内部各层路径（惰性 getter，随 MEMORY_HUB_ROOT 切换即时生效）。
@@ -144,14 +146,16 @@ export function saveHashState(state) {
  * @param {string} [app] 所属 app id
  */
 export function recordFile(filePath, sha256, mtimeMs, app) {
-  const state = loadHashState();
-  state.files[filePath] = {
-    sha256,
-    mtimeMs,
-    app: app || state.files[filePath]?.app,
-    lastSeen: new Date().toISOString(),
-  };
-  saveHashState(state);
+  withLock(storePaths.hashState, () => {
+    const state = loadHashState();
+    state.files[filePath] = {
+      sha256,
+      mtimeMs,
+      app: app || state.files[filePath]?.app,
+      lastSeen: new Date().toISOString(),
+    };
+    saveHashState(state);
+  });
 }
 
 /**
@@ -159,11 +163,13 @@ export function recordFile(filePath, sha256, mtimeMs, app) {
  * @param {string} filePath 源文件绝对路径
  */
 export function removeFileState(filePath) {
-  const state = loadHashState();
-  if (Object.prototype.hasOwnProperty.call(state.files, filePath)) {
-    delete state.files[filePath];
-    saveHashState(state);
-  }
+  withLock(storePaths.hashState, () => {
+    const state = loadHashState();
+    if (Object.prototype.hasOwnProperty.call(state.files, filePath)) {
+      delete state.files[filePath];
+      saveHashState(state);
+    }
+  });
 }
 
 /**
@@ -283,13 +289,14 @@ function renderSnapshot(hubId, appId, entry) {
   return lines.join('\n');
 }
 
-/** YAML 标量安全序列化（含特殊字符时加引号） */
+/**
+ * YAML 标量安全序列化（H5 修复）：一律 JSON.stringify 输出。
+ * 旧实现只对部分特殊字符加引号，`*`/`- `/`|`/`>`/`@`/`&` 开头的标题会产出
+ * 不可解析的 frontmatter（如 `title: *重要事项` 被 YAML 当锚点/别名）；
+ * JSON 双引号字符串是合法 YAML 标量，对任意输入都保证可解析。
+ */
 function yamlScalar(v) {
-  const s = String(v ?? '');
-  if (/[:#\n"'\\]/.test(s)) {
-    return JSON.stringify(s);
-  }
-  return s;
+  return JSON.stringify(String(v ?? ''));
 }
 
 /**
@@ -308,9 +315,14 @@ export function harvest(adapter) {
     const raw = adapter.read(filePath);
     if (!raw) continue;
     // 跨进程回环抑制（Bug#3）：其他进程（CLI 写回）刚写入的内容，
-    // 命中 inflight.json 登记（路径 + hash）则只记对账指纹、不摄取，避免自写内容重复进 sources
-    if (consumeInflight(filePath, raw.sha256)) {
-      recordFile(filePath, raw.sha256, raw.mtimeMs, adapter.id);
+    // 命中 inflight.json 登记（路径 + hash）则只记对账指纹、不摄取，避免自写内容重复进 sources。
+    // M3：仅精确命中（exact）才同步记指纹；dirWindow 命中只丢弃事件不写指纹，
+    // 否则窗口期内的真实外部修改会被永久漏摄取（窗口过期后轮询对账兜底）。
+    const suppress = consumeInflight(filePath, raw.sha256);
+    if (suppress) {
+      if (suppress.match === 'exact') {
+        recordFile(filePath, raw.sha256, raw.mtimeMs, adapter.id);
+      }
       continue;
     }
     const entries = adapter.parse(raw);

@@ -30,6 +30,7 @@ export const KEYCHAIN_SERVICE = 'memory-hub';
 export const KEY_NAMES = {
   codexOpenai: 'codex-openai', // 来源：~/.codex/auth.json 的 OPENAI_API_KEY
   idealab: 'idealab', // 来源：shell rc 中的 export IDEALAB_API_KEY=...
+  claudeAnthropic: 'claude-anthropic', // M4：shell rc 中的 export ANTHROPIC_API_KEY=...（存在才收录）
 };
 
 /**
@@ -79,7 +80,9 @@ export function parseShellExport(filePath, varName) {
 /**
  * 只读收集密钥来源（不触发任何 Keychain 操作）。
  * 1. Codex：~/.codex/auth.json → OPENAI_API_KEY（引用名 codex-openai）；
- * 2. 环境变量式：~/.zshrc、~/.zprofile → IDEALAB_API_KEY（引用名 idealab，取首个命中）。
+ * 2. 环境变量式：~/.zshrc、~/.zprofile → IDEALAB_API_KEY（引用名 idealab，取首个命中）；
+ * 3. M4：shell rc → ANTHROPIC_API_KEY（引用名 claude-anthropic，存在才收录；
+ *    本机 Claude Code 走 IDEALAB 环境变量已覆盖，此来源面向直连 Anthropic 的部署）。
  * @param {string} [home] 家目录（测试可注入伪造目录）
  * @returns {{ name: string, origin: string, value: string }[]}
  */
@@ -106,6 +109,16 @@ export function collectSecretSources(home = os.homedir()) {
     if (v) {
       sources.push({ name: KEY_NAMES.idealab, origin: rcPath, value: v });
       break; // 只取首个命中的 rc 文件
+    }
+  }
+
+  // 3) M4：shell rc 中的 export ANTHROPIC_API_KEY（存在才收录）
+  for (const rc of ['.zshrc', '.zprofile']) {
+    const rcPath = path.join(home, rc);
+    const v = parseShellExport(rcPath, 'ANTHROPIC_API_KEY');
+    if (v) {
+      sources.push({ name: KEY_NAMES.claudeAnthropic, origin: rcPath, value: v });
+      break;
     }
   }
   return sources;
@@ -136,10 +149,12 @@ function assertSecurityBin() {
 function runSecurity(args) {
   assertSecurityBin();
   try {
-    return execFileSync(SECURITY_BIN, args, { encoding: 'utf8' });
+    // M8：timeout 10s + SIGKILL 兜底（Keychain 弹窗/挂死时绝不永久阻塞 daemon）
+    return execFileSync(SECURITY_BIN, args, { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' });
   } catch (err) {
+    const timedOut = err?.killed || err?.signal === 'SIGKILL';
     throw new Error(
-      `security ${args[0]} 执行失败（退出码 ${err.status ?? '异常'}），请检查 Keychain 访问权限`,
+      `security ${args[0]} 执行失败（${timedOut ? '超时 10s 被强杀' : `退出码 ${err.status ?? '异常'}`}），请检查 Keychain 访问权限`,
     );
   }
 }
@@ -172,6 +187,13 @@ export function keychainExists(name) {
 export function keychainSet(name, secret, opts = {}) {
   assertDarwin();
   assertSecurityBin();
+  // L4：写入前检测同名条目，覆盖时向调用方交代（绝不静默覆盖）
+  let preExisting = false;
+  try {
+    preExisting = keychainExists(name);
+  } catch {
+    // 探测失败不阻塞写入
+  }
   const spawnImpl = opts.spawnImpl || spawnSync;
   // shell 脚本从 stdin 读入一行密码后 exec security：
   // 密钥不进 argv、不进环境变量、不出现在命令字符串中；
@@ -184,6 +206,8 @@ export function keychainSet(name, secret, opts = {}) {
     res = spawnImpl('/bin/sh', ['-c', script, '_', name], {
       input: `${secret}\n`,
       encoding: 'utf8',
+      timeout: 10000, // M8：超时兜底，防 Keychain 弹窗挂死
+      killSignal: 'SIGKILL',
     });
   } catch {
     throw new Error(`Keychain 条目 "${name}"（值 ${maskSecret(secret)}）写入失败：子进程调用异常`);
@@ -196,6 +220,7 @@ export function keychainSet(name, secret, opts = {}) {
       `Keychain 条目 "${name}"（值 ${maskSecret(secret)}）写入失败：security 退出码 ${res?.status ?? '异常'}${detail}`,
     );
   }
+  return { overwritten: preExisting };
 }
 
 /**
@@ -263,9 +288,11 @@ export function listKeys() {
 }
 
 /**
- * hub keys --sync：只读同步两个密钥来源到 Keychain。
+ * hub keys --sync：只读同步全部密钥来源到 Keychain。
+ * 来源：codex-openai（~/.codex/auth.json）、idealab（shell rc IDEALAB_API_KEY）、
+ * claude-anthropic（shell rc ANTHROPIC_API_KEY，M4，存在才收录）。
  * @param {{ home?: string }} [opts] home 缺省为 os.homedir()
- * @returns {{ name: string, origin: string, masked: string }[]} 本次同步的条目
+ * @returns {{ name: string, origin: string, masked: string, overwritten: boolean }[]} 本次同步的条目
  */
 export function syncKeys(opts = {}) {
   assertDarwin();
@@ -273,25 +300,35 @@ export function syncKeys(opts = {}) {
   const sources = collectSecretSources(home);
   const results = [];
   for (const src of sources) {
-    keychainSet(src.name, src.value);
-    results.push({ name: src.name, origin: src.origin, masked: maskSecret(src.value) });
+    const r = keychainSet(src.name, src.value);
+    results.push({
+      name: src.name,
+      origin: src.origin,
+      masked: maskSecret(src.value),
+      overwritten: Boolean(r?.overwritten),
+    });
   }
   return results;
 }
 
 /**
  * hub keys use <name>：切换 config.llm.keyRef 指向（先探测 Keychain 存在性）。
+ * M5：可选 --base-url / --model 一并落盘 config.llm（补齐 init 引导承诺的配置入口）。
  * @param {string} name 密钥引用名
+ * @param {{ baseUrl?: string, model?: string }} [opts] 可选 LLM 端点配置
  * @returns {Object} 更新后的配置
  */
-export function useKey(name) {
+export function useKey(name, opts = {}) {
   assertDarwin();
   if (!keychainExists(name)) {
     throw new Error(
       `Keychain 中不存在条目 "${name}"（service=${KEYCHAIN_SERVICE}），请先运行 hub keys --sync`,
     );
   }
-  return updateConfig({ llm: { keyRef: name } });
+  const llm = { keyRef: name };
+  if (opts.baseUrl) llm.baseUrl = String(opts.baseUrl);
+  if (opts.model) llm.model = String(opts.model);
+  return updateConfig({ llm });
 }
 
 /**

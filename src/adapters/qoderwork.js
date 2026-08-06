@@ -21,7 +21,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { BaseAdapter, makeEntry, listDirFiles, isIgnoredPath } from './base.js';
-import { writeFilesSafely } from './write-utils.js';
+import { statSafe, writeFilesSafely } from './write-utils.js';
 
 /** 写回成功后的固定提示（索引型，需对账/重建索引） */
 export const QODERWORK_WRITE_NOTE =
@@ -62,6 +62,20 @@ export class QoderworkAdapter extends BaseAdapter {
       files.push(...listDirFiles(dailyDir, (name) => name.endsWith('.md')));
     }
     return files;
+  }
+
+  /** M1 摄取白名单：顶层三个固定 md + memory/*.md（防任意用户文档被摄取） */
+  isIngestible(filePath) {
+    if (!this.owns(filePath)) return false;
+    const resolved = path.resolve(filePath);
+    return this.memoryPaths.some((dir) => {
+      const root = path.resolve(dir);
+      const parent = path.dirname(resolved);
+      const name = path.basename(resolved);
+      if (parent === root) return TOP_FILES.includes(name);
+      if (parent === path.join(root, 'memory')) return name.endsWith('.md');
+      return false;
+    });
   }
 
   parse(raw) {
@@ -204,6 +218,8 @@ export class QoderworkAdapter extends BaseAdapter {
     for (const dir of this.memoryPaths) {
       const dailyPath = path.join(dir, 'memory', `${dateStr}.md`);
       for (const entry of entries) {
+        // H2b：读取前抓取 mtime/size 快照，写前二次比对，防 App/用户并发追加被覆盖
+        const preStat = statSafe(dailyPath);
         const existing = fs.existsSync(dailyPath) ? fs.readFileSync(dailyPath, 'utf8') : '';
 
         // 幂等：已含该 hub-id 的 memory-chat 块 → 跳过
@@ -216,17 +232,27 @@ export class QoderworkAdapter extends BaseAdapter {
         const sep = existing && !existing.endsWith('\n') ? '\n' : '';
         const newContent = existing + sep + (existing || sep ? '\n' : '') + `${block}\n`;
 
-        const { backupDir } = writeFilesSafely([
-          {
-            path: dailyPath,
-            content: newContent,
-            verifyOpts: {
-              expectMarker: [`memory-chat:${entry.hubId}`, `/memory-chat:${entry.hubId}`],
+        let backupDir;
+        try {
+          ({ backupDir } = writeFilesSafely([
+            {
+              path: dailyPath,
+              content: newContent,
+              preStat,
+              verifyOpts: {
+                expectMarker: [`memory-chat:${entry.hubId}`, `/memory-chat:${entry.hubId}`],
+              },
+              app: this.id,
+              hubId: entry.hubId,
             },
-            app: this.id,
-            hubId: entry.hubId,
-          },
-        ]);
+          ]));
+        } catch (err) {
+          if (err.deferred) {
+            results.push({ hubId: entry.hubId, status: 'deferred', targets: [dailyPath], reason: `目标文件读写间隙被外部修改（${err.message}），放弃本轮稍后重试` });
+            continue;
+          }
+          throw err;
+        }
         results.push({ hubId: entry.hubId, status: 'written', targets: [dailyPath], backupDir, note: QODERWORK_WRITE_NOTE });
       }
     }
