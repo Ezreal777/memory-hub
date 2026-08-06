@@ -186,3 +186,33 @@ $ grep -r 'HUB-FIX' ~/.claude/projects ~/.qoderwork ~/.qoder/memories ~/Desktop/
 **修复复验 Overall：PASS（6/6 bug 修复确认；5 项新观察项已记录，其中 N1/N2 建议后续排期）**
 
 > 上轮"五、新会话召回人工验证待办"继续保留（状态不变，仍待人工开新会话验证）。
+
+## 十、评审修复复验（2026-08-06）
+
+复验对象：提交 `0312d62`（Ultra Review 修复清单 H1-H5/M1-M8/L1-L7，共 20 项）。方法：不信任修复者自述，全部用独立探针/真实运行取证；隔离验证一律 `MEMORY_HUB_ROOT` 隔离目录 + import 仓库真实源码；真实环境仅做最小冒烟（唯一标记 `[HUB-RV-20260806-v1]`，先备份后回滚）。
+
+### V1-V10 结论矩阵
+
+| 项 | 结论 | 关键证据 |
+|---|---|---|
+| V1 回归 | ✅ PASS | `npm test` 86/86 pass（duration 8.8s）；`git log` HEAD=0312d62、`git status` 干净（复验前） |
+| V2 H1 锁 | ✅ PASS | 多进程探针：4 个 node 子进程并发 register 80 条 → inflight.json 恰好 80 条无丢失；再 4 进程并发 consume → 80/80 exact 命中、零重复、终态 0 条。grep 确认全部读-改-写路径经 `withLock`：inflight（inflight.js:119/132/149/170）、hash-state（hub-store.js:149/166）、config（config.js:101/120）、writeback-log（writeback.js:75）、全局写回锁（writeback.js:307） |
+| V3 H2 写回守卫 | ✅ PASS | 隔离探针：preStat 过期（读后外部追加 → mtime/size 双变）→ 抛 `WriteDeferredError`（deferred=true）且目标文件外部新增内容逐字节保留；claude 索引自愈：条目文件已含 hubId 但 MEMORY.md 缺索引行 → write 返回 status=written、reason 含「自愈」、索引行被补写且既有行不重写。真实冒烟：hub backup → 向 codex 写带标记条目 → AGENTS.md 标记区正确写入（`<!-- memory-hub:start --> … [hub-rv-20260806-v1] … :end`）→ rollback 后 sha256 与事前基线逐字节一致（b04ae310…）→ grep 零残留。write.lock 行为证据：同进程派生探针中 A 持锁 4s，B 的 `runWriteback` 被阻塞 3911ms 后获锁写入、锁正常释放 |
+| V4 H3 崩溃降级 | ✅ PASS | 备份 config 后写入非法 JSON → daemon stop/start：daemon 正常启动（pid 43055），daemon.log 记一条 error「config.json 加载失败，降级使用缺省配置」，watcher 降级为 0 路径；launchd.err.log 全程 0 行（无崩溃风暴/30s 循环堆栈）。恢复 config 后 stop/start：watcher 恢复监听 5 路径，status 正常 |
+| V5 H4 撞名合并 | ✅ PASS | 隔离探针跑真实 `distill()`（mock client）两批同 slug：合并页 frontmatter `hub-id`/`sources`/`tags` 均为并集，旧正文保留、新内容进 `## 更新（时间）` 区；slug=README 冲突自动落盘 `README-page.md`，占位 README.md 未被覆盖（合并页全文已人工抽查） |
+| V6 H5 YAML | ✅ PASS | 隔离一次性脚本：`*重要事项`/`- 待办`/`@用户` 三标题 ingest 写快照 → `readSnapshot`（经 listUnprocessedSnapshots）全部读回、hubId 与正文无损；yamlScalar 一律 JSON.stringify（hub-store.js:292-300） |
+| V7 M1 白名单 | ✅ PASS | 代码：wukong isIngestible 仅放行顶层 MEMORY.md/USER.md/SOUL.md（TOP_FILES，wukong.js:26/115-121）；隔离用例 6 断言：三白名单放行，notes.txt/白名单外顶层 md/子目录 MEMORY.md 全部拒收 |
+| V8 M2 备份分池 | ✅ PASS | `hub backup` 实际落 `backups/full/2026-08-06T03-01-44-219Z`（320 文件）；冒烟写回批次备份落 `backups/writeback/2026-08-06T03-01-58-458Z`（manifest 含 origin/app/existed）；`hub rollback` 缺省命中 full 池该备份——尽管 writeback 池存在更新的批次备份，证明「缺省优先 full 最新」（latestBackupDir，safe-write.js:228-235） |
+| V9 M7/M8/L1 | ✅ PASS | M7：daemon.js:581-611 distill/writeback 双 busy 标志，重叠轮次跳过并记 warn；L1：util/log.js rotateLogFile（5MB/保留 3 份）统一入口，daemon 启动时对 launchd.out/err.log 补轮转（daemon.js:550-552）；`hub status` 五 App 全发现·启用、daemon 运行中 |
+| V10 终态 | ✅ PASS | daemon 运行中（pid 43897，V4 后恢复）；五 App 状态正常（hub status）；五 App 目录 + ~/.memory-hub 全域 grep `HUB-RV-20260806` exit=1 零残留；config.json sha256（da1b12ca…）与事前留存备份完全一致；探针草稿与隔离 root 全部删除 |
+
+### 复验中新发现的问题
+
+| 编号 | 级别 | 描述 |
+|---|---|---|
+| RV-O1 | 观察 | `writeLockPath()` 返回 `state/write.lock`，经 `withLock` 的 `lockPathFor` 追加 `.lock` 后真实锁文件为 `state/write.lock.lock`，命名易误导排障（曾导致复验探针持错锁文件）。行为正确，建议后续把目标名改为 `state/write` 或锁名显式化 |
+| RV-O2 | 观察 | V4 config 损坏降级期间 watcher 监听 0 路径（缺省配置无 memory_paths），属预期降级语义；但 daemon.log 的 error 仅出现一次，若用户长期不修复，后续无任何周期性提醒，可考虑定时重复告警 |
+
+### 结论
+
+**评审修复复验 Overall：PASS（V1-V10 全部通过；20 项修复均有独立运行证据，未发现新的产品缺陷；2 项低级别观察项 RV-O1/RV-O2 已记录）**
