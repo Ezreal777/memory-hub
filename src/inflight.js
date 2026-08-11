@@ -2,7 +2,7 @@
  * inflight.js —— 写回自写回环抑制状态（跨进程持久化版）。
  *
  * Bug#3 修复：原实现是进程内 Map，CLI 进程写回时 daemon 进程的 watcher 无法命中，
- * 导致写回事件被重复摄取进 sources。现改为共享文件 hub/state/inflight.json：
+ * 导致写回事件被重复摄取进 sources。现改为共享文件 state/inflight.json：
  *   - registerInflight：CLI/写回进程写入文件前原子登记「路径 + 预期 sha256 + 时间戳」；
  *   - consumeInflight：daemon/watcher 进程收到事件时读取文件判定（路径 + hash 命中即自写回环）；
  *   - 条目带 TTL（默认 10 分钟），读写时自动清理过期项，防止残留永久抑制；
@@ -28,11 +28,11 @@ export const INFLIGHT_TTL_MS = 10 * 60 * 1000;
 export const DIR_WINDOW_TTL_MS = 120 * 1000;
 
 /**
- * 共享状态文件路径 ~/.memory-hub/hub/state/inflight.json（惰性求值，随 MEMORY_HUB_ROOT 切换）。
+ * 共享状态文件路径 ~/.memory-hub/state/inflight.json（内部状态留在底层，惰性求值，随 MEMORY_HUB_ROOT 切换）。
  * @returns {string}
  */
 export function inflightStorePath() {
-  return path.join(paths.hub, 'state', 'inflight.json');
+  return path.join(paths.state, 'inflight.json');
 }
 
 /**

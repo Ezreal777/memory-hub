@@ -6,6 +6,8 @@
  * - 三级过滤：debounce（config.debounceMs 默认 2s）→ mtime 快筛（与 hash-state 比对）
  *   → SHA-256 精判（变化才摄取）；
  * - 60s（config.pollIntervalMs）轮询对账兜底，防 FSEvents 丢事件；
+ * - onIngest 回调：每次真实摄取（事件或对账）后通知调用方（daemon 据此做
+ *   事件驱动的增量整理调度）；回调异常只记日志，绝不影响摄取主流程；
  * - 回环抑制：registerInflight / clearInflight —— 写回引擎自写触发的事件（路径+hash 匹配）直接丢弃；
  * - 摄取走 hub-store.ingest；日志落 ~/.memory-hub/logs/watcher.log（不含任何密钥）。
  *
@@ -19,8 +21,17 @@ import { loadConfig } from './config.js';
 import { paths, ensureDir } from './util/paths.js';
 import { isIgnoredPath, readFileMeta } from './adapters/base.js';
 import { createAdapters, findAdapterByPath } from './adapters/registry.js';
-import { loadHashState, recordFile, removeFileState, ingest, harvest } from './hub-store.js';
-import { consumeInflight } from './inflight.js';
+import { DELETED_INFLIGHT_SHA } from './adapters/write-utils.js';
+import {
+  loadHashState,
+  recordFile,
+  removeFileState,
+  ingest,
+  harvest,
+  addTombstonesGuarded,
+  findSnapshotHubIdsBySource,
+} from './hub-store.js';
+import { consumeInflight, loadInflightEntries, loadDirWindows } from './inflight.js';
 import { appendLogEntry } from './util/log.js';
 
 // 回环抑制 API 集中在 inflight.js（避免 watcher ↔ adapters 循环依赖）；
@@ -50,9 +61,12 @@ export function logWatcher(app, file, action) {
 export class Watcher {
   /**
    * @param {Object} [config] 配置；缺省现读 loadConfig()
+   * @param {{ onIngest?: (info: { app: string, file?: string, count: number, bytes: number }) => void }} [hooks]
+   *   onIngest：每次真实摄取后回调（count 为快照条数，bytes 为正文体积估算）
    */
-  constructor(config) {
+  constructor(config, hooks = {}) {
     this.config = config || loadConfig();
+    this.onIngest = typeof hooks.onIngest === 'function' ? hooks.onIngest : null;
     this.adapters = createAdapters(this.config);
     this.debounceMs = this.config.debounceMs ?? 2000;
     this.pollIntervalMs = this.config.pollIntervalMs ?? 60000;
@@ -126,6 +140,16 @@ export class Watcher {
     return this._readyPromise || Promise.resolve();
   }
 
+  /** 通知调用方发生了真实摄取（回调异常只记日志，不影响主流程） */
+  notifyIngest(info) {
+    if (!this.onIngest) return;
+    try {
+      this.onIngest(info);
+    } catch (err) {
+      logWatcher('watcher', info.file || '', `onIngest 回调异常 ${err.message}`);
+    }
+  }
+
   /** 轮询兜底：对每个适配器执行一次 harvest 对账摄取 */
   reconcile() {
     for (const adapter of this.adapters) {
@@ -137,6 +161,9 @@ export class Watcher {
             '',
             `poll 对账摄取 ${result.ingested} 条（文件 ${result.files}，移除 ${result.removed}）`,
           );
+        }
+        if (result.ingested > 0) {
+          this.notifyIngest({ app: adapter.id, count: result.ingested, bytes: result.bytes || 0 });
         }
       } catch (err) {
         logWatcher(adapter.id, '', `poll 对账异常 ${err.message}`);
@@ -157,12 +184,90 @@ export class Watcher {
     this.pending.set(key, timer);
   }
 
-  /** 源文件删除：清理对账状态（sources 层快照保留，不可变） */
+  /**
+   * 源文件删除：清理对账状态（sources 层快照保留，不可变）+ 删除传播登记。
+   * 回环抑制：写回引擎自删（DELETED_INFLIGHT_SHA 哨兵）与 qoder 目录宽限窗口内的
+   * 删除（客户端改名/清理）一律抑制，绝不误判为用户删除；
+   * 去抖：编辑器「删 + 重建」原子保存会先 unlink 再 add——复用 pending Map，
+   * 后续同 key 的 add/change schedule 会清掉本定时器，自动取消删除判定。
+   */
   handleUnlink(filePath) {
     const adapter = findAdapterByPath(this.adapters, filePath);
     if (!adapter) return;
-    removeFileState(path.resolve(filePath));
-    logWatcher(adapter.id, filePath, 'unlink 源文件删除，已清理对账状态');
+    const resolved = path.resolve(filePath);
+    removeFileState(resolved);
+    // 写回删除自回环：命中删除哨兵 → 消费条目并丢弃（绝不登记 tombstone）；
+    // 先无副作用探测再消费，避免误消费其它 pending 写入的 inflight 条目
+    const inflightEntry = loadInflightEntries()[resolved];
+    if (inflightEntry && inflightEntry.sha256 === DELETED_INFLIGHT_SHA) {
+      consumeInflight(resolved, DELETED_INFLIGHT_SHA);
+      logWatcher(adapter.id, filePath, 'unlink 命中写回删除哨兵，丢弃（自删回环）');
+      return;
+    }
+    // 目录级宽限窗口（qoder 客户端改名/重写）内的删除事件同样抑制
+    for (const dir of Object.keys(loadDirWindows())) {
+      if (resolved === dir || resolved.startsWith(`${dir}${path.sep}`)) {
+        logWatcher(adapter.id, filePath, `unlink 命中目录宽限窗口（${dir}），丢弃`);
+        return;
+      }
+    }
+    logWatcher(adapter.id, filePath, 'unlink 源文件删除，已清理对账状态，待去抖确认删除传播');
+    if (this.pending.has(resolved)) {
+      clearTimeout(this.pending.get(resolved));
+    }
+    const timer = setTimeout(() => {
+      this.pending.delete(resolved);
+      this.recordUnlinkTombstones(resolved, adapter);
+    }, this.debounceMs);
+    this.pending.set(resolved, timer);
+  }
+
+  /**
+   * 去抖到期后的删除传播落地：二次确认文件仍不存在 → 按源路径反查快照 hubId →
+   * 登记 tombstone 清单（后续由 distill 消费打 wiki 标记、writeback 移除 App 侧条目）。
+   * MUST-2 风暴熔断：走 addTombstonesGuarded——单适配器窗口内登记超阈值
+   * （config.tombstone.stormThreshold）即熔断，后续 unlink 只记日志不登记，
+   * 已登记的打 suspectedStorm 标记（自动传播跳过，需人工确认）。
+   * 边界：聚合文件（如 codex AGENTS.md）内单条目删除不触发 unlink，本期不检测。
+   * 异常只记日志，绝不影响 watcher 主流程。
+   * @param {string} filePath 已 resolve 的源文件路径
+   * @param {Object} adapter 所属适配器
+   */
+  recordUnlinkTombstones(filePath, adapter) {
+    try {
+      if (fs.existsSync(filePath)) return; // 去抖期内已重建（编辑器原子保存）：非真实删除
+      const hubIds = findSnapshotHubIdsBySource(filePath);
+      if (hubIds.length === 0) {
+        logWatcher(adapter.id, filePath, 'unlink 未找到对应快照 hubId，跳过 tombstone 登记');
+        return;
+      }
+      const tombCfg = this.config.tombstone || {};
+      const { added, suppressed, tripped } = addTombstonesGuarded(
+        hubIds.map((hubId) => ({ hubId, app: adapter.id, source: filePath })),
+        { stormThreshold: tombCfg.stormThreshold, stormWindowMs: tombCfg.stormWindowMs },
+      );
+      if (tripped.length > 0) {
+        logWatcher(
+          adapter.id,
+          filePath,
+          `unlink 触发删除风暴熔断（窗口内登记超阈值），窗口内条目已打 suspectedStorm 标记，需 hub tombstone 人工确认`,
+        );
+      }
+      if (suppressed.length > 0) {
+        logWatcher(
+          adapter.id,
+          filePath,
+          `unlink 风暴熔断中，本次 ${suppressed.length} 条仅记日志不登记 tombstone：${suppressed.join(',')}`,
+        );
+      }
+      logWatcher(
+        adapter.id,
+        filePath,
+        `unlink 已登记 tombstone ${added.length}/${hubIds.length} 条（删除传播）`,
+      );
+    } catch (err) {
+      logWatcher(adapter.id, filePath, `unlink tombstone 登记异常 ${err.message}`);
+    }
   }
 
   /**
@@ -230,6 +335,10 @@ export class Watcher {
       filePath,
       `${event} 摄取 ${entries.length} 条快照`,
     );
+    if (entries.length > 0) {
+      const bytes = entries.reduce((n, e) => n + String(e.body || '').length, 0);
+      this.notifyIngest({ app: adapter.id, file: filePath, count: entries.length, bytes });
+    }
   }
 
   /** 注册 SIGINT/SIGTERM 优雅退出（关闭 watcher + 清理定时器） */

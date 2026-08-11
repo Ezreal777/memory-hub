@@ -8,9 +8,12 @@
  *   hub scan        探测五个 App 的记忆位置并写回 config.json
  *   hub keys        Keychain 密钥管理（list / --sync / use <name>）
  *   hub watch       前台监听增量摄取
- *   hub index       重建主索引
+ *   hub index       重建主索引（rebuildMasterIndex：全量收录 + hub-id 回填）
  *   hub distill     LLM 整理 sources → wiki
- *   hub writeback   wiki 并行写回各 App
+ *   hub writeback   wiki 并行写回各 App（默认增量；--full 全量；--repair 修复 codex 多标记区）
+ *   hub doctor      健康度体检（纯只读，✅/⚠️/❌ 分级；--json 结构化输出）
+ *   hub search      wiki 关键词检索（grep 级，多关键词 AND，大小写不敏感）
+ *   hub tombstone   删除传播管理（list / apply [--dry-run] / drop；MUST-2 安全阀）
  *   hub backup      对全部已发现 app 的记忆文件做一次快照备份
  *   hub rollback    从备份目录原子恢复（二次确认，--yes 跳过）
  *   hub sync        单次全链路：harvest → distill → writeback（排障/验证）
@@ -23,14 +26,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
+import matter from 'gray-matter';
 import { loadConfig } from './config.js';
 import { paths, ensureHubDirs, ensureDir, FILE_MODE } from './util/paths.js';
 import { scanApps, formatScanSummary } from './scan.js';
 import { listKeys, syncKeys, useKey } from './keys.js';
 import { Watcher } from './watcher.js';
 import { createAdapters } from './adapters/registry.js';
-import { generateMasterIndex, ensureHubStore, harvest } from './hub-store.js';
-import { distill, loadDistillState } from './distill.js';
+import {
+  ensureHubStore,
+  harvest,
+  storePaths,
+  loadTombstones,
+  removeTombstones,
+} from './hub-store.js';
+import { rebuildMasterIndex } from './index-builder.js';
+import { repairFile } from './adapters/codex.js';
+import { runDoctor, formatDoctorReport } from './doctor.js';
+import { searchWiki, formatSearchResults } from './search.js';
+import { distill, loadDistillState, applyTombstones } from './distill.js';
 import {
   runWriteback,
   formatWritebackSummary,
@@ -56,6 +70,23 @@ import {
   tailLines,
   LAUNCHD_LABEL,
 } from './daemon.js';
+
+/**
+ * SHOULD-6：CLI 交互命令的抢锁超时（30s）。daemon 内部调用维持 withLock 默认 120s；
+ * 交互场景等 30s 仍抢不到基本可判定锁被 daemon 长写回持有，尽快提示而非干等。
+ */
+export const CLI_LOCK_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * 判断异常是否为抢锁超时，并给出面向用户的友好提示。
+ * @param {Error} err
+ * @returns {string|null} 是抢锁超时则返回提示文案，否则 null
+ */
+export function lockTimeoutHint(err) {
+  return /抢锁超时/.test(String(err?.message || ''))
+    ? '锁被 daemon 持有，请稍后再试（daemon 正在整理/写回，通常 1-2 分钟内完成）'
+    : null;
+}
 
 const program = new Command();
 
@@ -176,11 +207,12 @@ program
   });
 
 // hub index —— 重新生成 _index/master-index.md（扫 wiki/）
+// H7 接线：改调 index-builder.rebuildMasterIndex（全量收录、头部计数用实际值、hub-id 回填）
 program
   .command('index')
-  .description('扫描 wiki/ 生成主索引 _index/master-index.md')
+  .description('扫描 wiki/ 全量重建主索引 _index/master-index.md（含 hub-id 回填）')
   .action(() => {
-    const p = generateMasterIndex();
+    const p = rebuildMasterIndex();
     console.log(`已生成主索引: ${p}`);
   });
 
@@ -190,11 +222,26 @@ program
   .description('用 LLM 把 sources/ 中未整理的原始快照归并为 wiki 主题页（脱敏后落盘）')
   .option('--dry-run', '只打印将产生的页面变更，不落盘不改状态')
   .option('--max-pages <n>', '本次最多产出的 wiki 页数', (v) => parseInt(v, 10))
+  .option('--max-batches <n>', '本次最多处理的批次数（每批一次 LLM 调用，剩余下轮继续）', (v) => parseInt(v, 10))
   .action(async (opts) => {
-    const result = await distill({ dryRun: !!opts.dryRun, maxPages: opts.maxPages });
+    let result;
+    try {
+      result = await distill({ dryRun: !!opts.dryRun, maxPages: opts.maxPages, maxBatches: opts.maxBatches });
+    } catch (err) {
+      // SHOULD-6：状态文件锁被 daemon 持有时给明确提示，而非裸抛堆栈
+      const hint = lockTimeoutHint(err);
+      console.error(hint ? `⚠️ ${hint}` : `⚠️ 整理失败: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
     if (!result.ok) {
       // LLM 失败优雅降级：sources 保留，下次重试
-      console.error(`⚠️ 整理失败（sources 已保留，下次可重试）: ${result.error}`);
+      const hint = lockTimeoutHint({ message: result.error });
+      console.error(
+        hint
+          ? `⚠️ ${hint}`
+          : `⚠️ 整理失败（sources 已保留，下次可重试）: ${result.error}`,
+      );
       process.exitCode = 1;
       return;
     }
@@ -211,30 +258,114 @@ program
       }
       return;
     }
-    console.log(`✅ 整理完成：${result.pending} 条快照 → ${result.written.length} 个页面（归并 hubId ${result.processed} 个）`);
+    console.log(`✅ 整理完成：待整理 ${result.pending} 条，本次处理 ${result.batches}/${result.totalBatches} 批 → ${result.written.length} 个页面（归并 hubId ${result.processed} 个）`);
     for (const p of result.pages) {
       console.log(`  - wiki/${p.slug}.md · ${p.title}（${p.hubIds.length} 条归并）`);
+    }
+    if (result.error) {
+      console.error(`⚠️ 部分批次失败（已完成批次不受影响，未处理快照下次重试）: ${result.error}`);
+    }
+    if (result.totalBatches > result.batches) {
+      console.log(`ℹ️ 尚余 ${result.totalBatches - result.batches} 批未处理，再次执行 hub distill 或等 daemon 下轮继续`);
     }
     console.log(`主索引已更新: ${result.index}`);
   });
 
+// ---------------------------------------------------------------------------
 // hub writeback —— 并行写回：wiki（或 sources）条目 → 各 App 记忆文件
+// ---------------------------------------------------------------------------
+
+/**
+ * hub writeback --repair：调 codex 的 repairFile 修复 AGENTS.md 多标记区
+ * （去重合并，走备份→原子写→校验→失败回滚）。默认目标从 config 读 codex 的
+ * memory_paths；目前仅支持 codex（其余 app 无标记区语义）。
+ * @param {{ app?: string, config?: Object }} [opts]
+ * @returns {{ ok: boolean, error?: string, results?: Object[] }} results 为逐文件三态结果
+ */
+export function runWritebackRepair(opts = {}) {
+  const appId = opts.app || 'codex';
+  if (appId !== 'codex') {
+    return { ok: false, error: `--repair 目前仅支持 codex（AGENTS.md 多标记区修复），收到 "${appId}"` };
+  }
+  const config = opts.config || loadConfig();
+  const appCfg = (config.apps || []).find((a) => a.id === 'codex') || {};
+  const targets = Array.isArray(appCfg.memory_paths) ? appCfg.memory_paths : [];
+  if (targets.length === 0) {
+    return { ok: false, error: 'config 中 codex 没有 memory_paths（先运行 hub scan 探测 AGENTS.md 位置）' };
+  }
+  const results = targets.map((file) => {
+    try {
+      return repairFile(file);
+    } catch (err) {
+      // 单文件失败隔离（repairFile 内部失败会自动按备份回滚），不影响其余目标
+      return { path: file, status: 'error', error: err.message };
+    }
+  });
+  return { ok: results.every((r) => r.status !== 'error'), results };
+}
+
+/**
+ * 把 --repair 结果格式化为人类可读摘要（三态 + 去重统计）。
+ * @param {Object} repair runWritebackRepair 返回值
+ * @returns {string}
+ */
+export function formatRepairSummary(repair) {
+  if (repair.error) return `❌ ${repair.error}`;
+  const lines = ['codex AGENTS.md 标记区修复（--repair）:'];
+  for (const r of repair.results) {
+    if (r.status === 'missing') {
+      lines.push(`  ⚠️ ${r.path} —— missing：文件不存在（scan 探测的路径可能已失效）`);
+    } else if (r.status === 'clean') {
+      lines.push(`  ✅ ${r.path} —— clean：标记区正常（区数 ${r.regionCount}），无需修复`);
+    } else if (r.status === 'repaired') {
+      lines.push(
+        `  🔧 ${r.path} —— repaired：${r.regionCount} 个标记区合并为 1 个，` +
+          `块 ${r.totalBlocks} → ${r.uniqueBlocks}（去重 ${r.duplicateBlocks}）`,
+      );
+      if (r.backupDir) lines.push(`     备份: ${r.backupDir}（可 hub rollback --dir 恢复）`);
+    } else {
+      lines.push(`  ❌ ${r.path} —— ${r.status}：${r.error || '未知错误'}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 program
   .command('writeback')
-  .description('把 wiki 整理页（或 --from-sources 快照）并行写回各 App 记忆文件')
+  .description('把 wiki 整理页并行写回各 App 记忆文件（默认增量：消费 pending-writeback.json 清单）')
   .option('--app <id>', '仅写回指定 app（claude|codex|qoder|qoderwork|wukong）')
   .option('--dry-run', '只打印各适配器的 render 结果，不产生任何写入')
   .option('--entry <hubId>', '仅写回包含指定 hub-id 的条目')
   .option('--from-sources', '数据源改用 sources/ 快照（透传测试）')
   .option('--force-batch3', '临时放行 batch:3 高风险批次（qoderwork/wukong）')
+  .option('--full', '强制全量广播（忽略 pending-writeback.json 增量清单）')
+  .option('--repair', '修复 codex AGENTS.md 多标记区（去重合并，含备份；仅支持 --app codex）')
   .action(async (opts) => {
-    const result = await runWriteback({
-      app: opts.app,
-      dryRun: !!opts.dryRun,
-      entry: opts.entry,
-      fromSources: !!opts.fromSources,
-      forceBatch3: !!opts.forceBatch3,
-    });
+    // --repair：独立的修复流程，不进入写回管线
+    if (opts.repair) {
+      const repair = runWritebackRepair({ app: opts.app });
+      console.log(formatRepairSummary(repair));
+      if (!repair.ok) process.exitCode = 1;
+      return;
+    }
+    let result;
+    try {
+      result = await runWriteback({
+        app: opts.app,
+        dryRun: !!opts.dryRun,
+        entry: opts.entry,
+        fromSources: !!opts.fromSources,
+        forceBatch3: !!opts.forceBatch3,
+        full: !!opts.full,
+        // SHOULD-6：交互命令 30s 抢锁超时（daemon 内部调用不传，维持 120s 默认）
+        lockTimeoutMs: CLI_LOCK_TIMEOUT_MS,
+      });
+    } catch (err) {
+      const hint = lockTimeoutHint(err);
+      console.error(hint ? `⚠️ ${hint}` : `❌ 写回失败: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
     console.log(formatWritebackSummary(result, { dryRun: !!opts.dryRun }));
     if (!result.ok && result.error) process.exitCode = 1;
   });
@@ -252,7 +383,8 @@ export function runInit() {
   loadConfig(); // 惰性生成默认 config.json（600 权限）
   console.log(`✅ 数据目录已就绪: ${paths.root}`);
   console.log(`   配置文件: ${paths.config}`);
-  console.log(`   中转站: ${paths.hub}`);
+  console.log(`   中转站（桌面可视）: ${paths.hub}`);
+  console.log(`   日志（桌面镜像 / 底层权威份）: ${paths.userLogs} / ${paths.logs}`);
   console.log('');
   console.log('自动执行 hub scan，探测五个 App 的记忆位置…');
   const rows = scanApps();
@@ -569,6 +701,7 @@ export function getStatusReport(opts = {}) {
   const lines = [];
   lines.push('════════ Memory Hub 状态汇总 ════════');
   lines.push(`数据根目录: ${paths.root}`);
+  lines.push(`中转站（桌面可视）: ${paths.hub}`);
   lines.push('');
 
   // 1. 五个 app 的发现状态 / 路径 / enabled
@@ -602,10 +735,13 @@ export function getStatusReport(opts = {}) {
   lines.push(`  最近活动: ${watcherTail.length > 0 ? watcherTail[0] : '（无记录）'}`);
   lines.push('');
 
-  // 4. distill 进度
+  // 4. distill 进度（含隔离/毒批计数，详情看 hub doctor）
   lines.push('【distill】');
   const ds = loadDistillState();
   lines.push(`  已整理 hubId: ${Object.keys(ds.processed).length} 条`);
+  lines.push(
+    `  隔离快照 ${Object.keys(ds.quarantined || {}).length} 条 / 毒批隔离 ${Object.keys(ds.poisonedBatches || {}).length} 个`,
+  );
   lines.push('');
 
   // 5. writeback-log 最近 5 条
@@ -625,6 +761,12 @@ export function getStatusReport(opts = {}) {
   lines.push(
     `  现存 ${listBackupDirs().length} 份（全量池上限 ${MAX_FULL_BACKUPS} / 写回池上限 ${MAX_BACKUPS}，目录: ${paths.backups}）`,
   );
+  lines.push('');
+
+  // 7. 日志与健康度提示（权威份在底层，桌面仅镜像）
+  lines.push('【日志与健康度】');
+  lines.push(`  权威日志: ${paths.logs}（桌面 ${paths.userLogs} 为镜像，仅供查看）`);
+  lines.push('  运行 hub doctor 查看健康度报告（索引/隔离/积压/写回/备份/锁/测试污染）');
   return lines.join('\n');
 }
 
@@ -633,6 +775,270 @@ program
   .description('一屏汇总：app 发现状态 / daemon / watcher / distill / writeback-log / backups')
   .action(() => {
     console.log(getStatusReport());
+  });
+
+// ---------------------------------------------------------------------------
+// hub doctor —— 健康度体检（纯只读）
+// ---------------------------------------------------------------------------
+
+program
+  .command('doctor')
+  .description('健康度体检（纯只读）：索引完整率/重复标题/隔离与失败/distill 积压/写回健康/备份池/锁状态/测试污染')
+  .option('--json', '输出结构化 JSON 报告')
+  .action((opts) => {
+    const report = runDoctor();
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatDoctorReport(report));
+    }
+    // 有 ❌ 项时以非零码退出（脚本可据此告警）
+    if (!report.ok) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------------------
+// hub search —— wiki 关键词检索（grep 级）
+// ---------------------------------------------------------------------------
+
+program
+  .command('search <keywords...>')
+  .description('检索 wiki（标题/tags/frontmatter/正文；大小写不敏感，多关键词 AND）')
+  .option('--limit <n>', '最多显示的命中条数（缺省 20）', (v) => parseInt(v, 10))
+  .action((keywords, opts) => {
+    console.log(formatSearchResults(searchWiki(keywords, { limit: opts.limit })));
+  });
+
+// ---------------------------------------------------------------------------
+// hub tombstone —— 删除传播管理（MUST-2 安全阀的显式操作面）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把 tombstone 清单按闭环进度分为三态：
+ * - pendingWiki：待 wiki 标记（未 wikiApplied）；
+ * - pendingApps：wiki 已标记、待写回清理（wikiApplied 且未 appsCleaned）；
+ * - closed：已闭环（wikiApplied 且 appsCleaned）。
+ * @param {Object} [state] loadTombstones 结果（缺省现读）
+ * @returns {{ pendingWiki: Object[], pendingApps: Object[], closed: Object[] }}
+ */
+export function classifyTombstones(state = loadTombstones()) {
+  const groups = { pendingWiki: [], pendingApps: [], closed: [] };
+  for (const [hubId, t] of Object.entries(state.tombstones || {})) {
+    const row = { hubId, ...t };
+    if (!t.wikiApplied) groups.pendingWiki.push(row);
+    else if (!t.appsCleaned) groups.pendingApps.push(row);
+    else groups.closed.push(row);
+  }
+  return groups;
+}
+
+/** 单条 tombstone 的展示行（含 suspectedStorm 风暴标记） */
+function tombstoneRow(t) {
+  const storm = t.suspectedStorm === true ? ' 🌩️疑似风暴' : '';
+  return `  - ${t.hubId}  [${t.app || '?'}]  删于 ${t.deletedAt || '?'}${storm}${t.source ? `\n    源: ${t.source}` : ''}`;
+}
+
+/**
+ * 格式化 hub tombstone list 输出（三态 + 风暴标记 + 自动传播开关状态）。
+ * @param {Object} [state] loadTombstones 结果（缺省现读）
+ * @param {Object} [config] 配置（缺省 loadConfig）
+ * @returns {string}
+ */
+export function formatTombstoneList(state = loadTombstones(), config = loadConfig()) {
+  const groups = classifyTombstones(state);
+  const total = groups.pendingWiki.length + groups.pendingApps.length + groups.closed.length;
+  const stormCount = [...groups.pendingWiki, ...groups.pendingApps, ...groups.closed].filter(
+    (t) => t.suspectedStorm === true,
+  ).length;
+  const auto = config.tombstone?.autoPropagate === true;
+  const lines = [];
+  lines.push(`tombstone 共 ${total} 条（自动传播: ${auto ? '开启' : '关闭'}，疑似风暴 ${stormCount} 条）`);
+  if (total === 0) {
+    lines.push('（清单为空）');
+    return lines.join('\n');
+  }
+  lines.push('', `【待 wiki 标记】${groups.pendingWiki.length} 条`);
+  for (const t of groups.pendingWiki) lines.push(tombstoneRow(t));
+  lines.push('', `【待写回清理】${groups.pendingApps.length} 条`);
+  for (const t of groups.pendingApps) lines.push(tombstoneRow(t));
+  lines.push('', `【已闭环】${groups.closed.length} 条`);
+  for (const t of groups.closed) lines.push(tombstoneRow(t));
+  if (!auto && groups.pendingWiki.length + groups.pendingApps.length > 0) {
+    lines.push('', '提示: 自动传播已关闭，运行 hub tombstone apply [--dry-run] 显式执行传播');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 预览一次 tombstone apply 的影响面（纯只读，不动任何数据）：
+ * - 待 wiki 标记的 hubId 命中哪些 wiki 页（整页删除 vs 部分剔除，与
+ *   applyTombstones 同样只扫 wiki 根目录顶层页）；
+ * - 待写回清理的 hubId 将从哪些启用 App（可写、非 readOnly）移除。
+ * @param {{ state?: Object, config?: Object }} [opts] 可注入状态/配置（测试用）
+ * @returns {{ pendingWikiIds: string[], removalIds: string[], stormIds: string[],
+ *   deletedPages: string[], updatedPages: string[], apps: string[] }}
+ */
+export function previewTombstoneApply(opts = {}) {
+  const state = opts.state || loadTombstones();
+  const config = opts.config || loadConfig();
+  const entries = Object.entries(state.tombstones || {});
+  const pendingWikiIds = entries.filter(([, t]) => !t.wikiApplied).map(([id]) => id);
+  const removalIds = entries.filter(([, t]) => !t.appsCleaned).map(([id]) => id);
+  const stormIds = entries.filter(([, t]) => t.suspectedStorm === true).map(([id]) => id);
+
+  // 命中页扫描：与 applyTombstones ② 同范围（wiki 根目录顶层 .md，跳过 README）
+  const pendingSet = new Set(pendingWikiIds);
+  const deletedPages = [];
+  const updatedPages = [];
+  let dirEntries = [];
+  try {
+    dirEntries = fs.readdirSync(storePaths.wiki, { withFileTypes: true });
+  } catch {
+    dirEntries = [];
+  }
+  for (const e of dirEntries) {
+    if (!e.isFile() || !e.name.endsWith('.md') || e.name === 'README.md') continue;
+    let parsed;
+    try {
+      parsed = matter(fs.readFileSync(path.join(storePaths.wiki, e.name), 'utf8'));
+    } catch {
+      continue;
+    }
+    const rawIds = parsed.data?.['hub-id'];
+    const pageIds = (Array.isArray(rawIds) ? rawIds : rawIds ? [rawIds] : []).map(String);
+    const hit = pageIds.filter((id) => pendingSet.has(id));
+    if (hit.length === 0) continue;
+    if (hit.length === pageIds.length) deletedPages.push(e.name);
+    else updatedPages.push(e.name);
+  }
+
+  // 受影响的写回目标 App：启用、有路径、非只读
+  const apps = (config.apps || [])
+    .filter(
+      (a) =>
+        a.enabled === true &&
+        Array.isArray(a.memory_paths) &&
+        a.memory_paths.length > 0 &&
+        a.readOnly !== true &&
+        !/read[-_ ]?only/i.test(String(a.notes || '')),
+    )
+    .map((a) => a.id);
+  return { pendingWikiIds, removalIds, stormIds, deletedPages, updatedPages, apps };
+}
+
+/** 把影响面预览格式化为人类可读文本（dry-run 与执行前确认共用） */
+export function formatTombstonePreview(preview) {
+  const lines = [];
+  lines.push(`待 wiki 标记: ${preview.pendingWikiIds.length} 条 hubId`);
+  lines.push(
+    `  → 整页删除 ${preview.deletedPages.length} 页${preview.deletedPages.length > 0 ? `: ${preview.deletedPages.join(', ')}` : ''}`,
+  );
+  lines.push(
+    `  → 部分剔除 ${preview.updatedPages.length} 页${preview.updatedPages.length > 0 ? `: ${preview.updatedPages.join(', ')}` : ''}`,
+  );
+  lines.push(`待写回清理: ${preview.removalIds.length} 条 hubId → 目标 App: ${preview.apps.join(', ') || '（无）'}`);
+  if (preview.stormIds.length > 0) {
+    lines.push(`⚠️ 其中 ${preview.stormIds.length} 条带 suspectedStorm 风暴标记，本次将一并执行（确认前请核实）`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 显式执行一次 tombstone 传播（hub tombstone apply，不带 --dry-run）：
+ * ① applyTombstones(force)：wiki 标记 + 重放防护（含 suspectedStorm 条目）；
+ * ② runWriteback(removalsOnly + forceTombstones)：各 App 侧条目移除与 appsCleaned 闭环。
+ * @param {{ config?: Object, adapters?: Object[], lockTimeoutMs?: number }} [opts] 测试可注入
+ * @returns {Promise<{ tombstone: Object, writeback: Object }>}
+ */
+export async function runTombstoneApply(opts = {}) {
+  const config = opts.config || loadConfig();
+  const tombstone = applyTombstones(loadDistillState(), { config, force: true });
+  const writeback = await runWriteback({
+    config,
+    adapters: opts.adapters,
+    removalsOnly: true,
+    forceTombstones: true,
+    lockTimeoutMs: opts.lockTimeoutMs ?? CLI_LOCK_TIMEOUT_MS,
+  });
+  return { tombstone, writeback };
+}
+
+const tombstoneCmd = program
+  .command('tombstone')
+  .description('删除传播管理：list 三态清单 / apply 显式传播（--dry-run 预览）/ drop 撤销误登记');
+
+tombstoneCmd
+  .command('list')
+  .description('列出全部 tombstone（三态：待 wiki 标记/待写回清理/已闭环，含 suspectedStorm 标记）')
+  .action(() => {
+    console.log(formatTombstoneList());
+  });
+
+tombstoneCmd
+  .command('apply')
+  .description('显式执行删除传播（含 suspectedStorm 条目；--dry-run 只预览影响面，执行需 --yes 确认）')
+  .option('--dry-run', '只预览将影响的 wiki 页与各 App 目标，不做任何写入')
+  .option('--yes', '跳过交互确认直接执行')
+  .action(async (opts) => {
+    const preview = previewTombstoneApply();
+    if (preview.pendingWikiIds.length === 0 && preview.removalIds.length === 0) {
+      console.log('没有待传播的 tombstone（清单为空或已全部闭环）');
+      return;
+    }
+    console.log(formatTombstonePreview(preview));
+    if (opts.dryRun) {
+      console.log('[dry-run] 仅预览，未做任何写入');
+      return;
+    }
+    if (!opts.yes) {
+      const ok = await askYesNo('确认执行上述删除传播？（不可逆，建议先 hub backup）(y/N) ');
+      if (!ok) {
+        console.log('已取消，未做任何写入');
+        return;
+      }
+    }
+    try {
+      const { tombstone, writeback } = await runTombstoneApply();
+      console.log(
+        `✅ wiki 侧：整页删除 ${tombstone.deletedPages.length} 页 / 部分剔除 ${tombstone.updatedPages.length} 页 / 解除（源已重建）${tombstone.lifted.length} 条`,
+      );
+      console.log(formatWritebackSummary(writeback));
+    } catch (err) {
+      const hint = lockTimeoutHint(err);
+      console.error(hint ? `⚠️ ${hint}` : `❌ 传播失败: ${err.message}`);
+      process.exitCode = 1;
+    }
+  });
+
+tombstoneCmd
+  .command('drop [hubId]')
+  .description('撤销误登记的 tombstone（指定 hubId，或 --all-storm 批量撤销全部风暴标记条目）')
+  .option('--all-storm', '撤销全部带 suspectedStorm 标记的条目')
+  .action((hubId, opts) => {
+    if (opts.allStorm) {
+      const { tombstones } = loadTombstones();
+      const ids = Object.entries(tombstones)
+        .filter(([, t]) => t.suspectedStorm === true)
+        .map(([id]) => id);
+      if (ids.length === 0) {
+        console.log('没有带 suspectedStorm 标记的 tombstone');
+        return;
+      }
+      const removed = removeTombstones(ids);
+      console.log(`✅ 已撤销 ${removed.length} 条风暴标记的 tombstone（对应记忆不会被删除传播）`);
+      return;
+    }
+    if (!hubId) {
+      console.error('❌ 请指定要撤销的 hubId，或用 --all-storm 批量撤销风暴标记条目');
+      process.exitCode = 1;
+      return;
+    }
+    const removed = removeTombstones([hubId]);
+    if (removed.length === 0) {
+      console.error(`❌ 未找到 tombstone "${hubId}"（hub tombstone list 查看现存清单）`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`✅ 已撤销 tombstone ${hubId}（对应记忆不会被删除传播）`);
   });
 
 // ---------------------------------------------------------------------------

@@ -56,6 +56,61 @@ export function createBackupDir() {
 }
 
 /**
+ * 删除哨兵（删除传播）：removeFilesSafely 删文件前用该值 registerInflight。
+ * unlink 事件无内容 hash 可比，watcher.handleUnlink 按路径命中此哨兵即判定
+ * 为写回引擎自删（而非用户删除），绝不登记 tombstone 形成回环。
+ * inflight.js 为只读依赖，哨兵常量集中定义在写回侧本模块。
+ */
+export const DELETED_INFLIGHT_SHA = 'memory-hub:deleted';
+
+/**
+ * 安全删除一组文件（删除传播写回侧唯一删除入口）。
+ *
+ * 流程：同批备份（manifest 记 app/hubId，rollback 可恢复）→ 逐文件
+ * registerInflight(路径, DELETED_INFLIGHT_SHA) → 删除；中途失败则恢复已删文件
+ * 并清理本批 inflight 预期后抛错（附 backupDir）。
+ *
+ * @param {{ path: string, app?: string, hubId?: string, as?: string }[]} files 待删文件清单
+ * @param {{ dirWindows?: string[] }} [opts] dirWindows：需登记目录级宽限窗口的目录
+ *   （仅对已知存在客户端后处理行为的适配器如 qoder 启用）
+ * @returns {{ backupDir: string, removed: string[] }} 本批备份目录与实际删除的路径
+ */
+export function removeFilesSafely(files, opts = {}) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error('removeFilesSafely: files 不能为空');
+  }
+  const backupDir = createBackupDir();
+  const backups = new Map(); // path → 备份文件路径（目标不存在则为 null）
+  for (const f of files) {
+    backups.set(f.path, backupTo(f.path, backupDir, { app: f.app, hubId: f.hubId, as: f.as }));
+  }
+  const removed = [];
+  try {
+    for (const f of files) {
+      registerInflight(f.path, DELETED_INFLIGHT_SHA);
+      fs.rmSync(f.path, { force: true });
+      removed.push(f.path);
+    }
+  } catch (err) {
+    // 失败回滚：已删文件从备份恢复，本批全部 inflight 预期清理
+    for (const f of files) {
+      const backupPath = backups.get(f.path);
+      if (backupPath && !fs.existsSync(f.path)) {
+        atomicWrite(f.path, fs.readFileSync(backupPath, 'utf8'));
+      }
+      clearInflight(f.path);
+    }
+    err.backupDir = backupDir;
+    throw err;
+  }
+  // N1：删除后的客户端后处理（如 qoder 目录重建索引）同样需目录级宽限窗口
+  for (const dir of opts.dirWindows || []) {
+    registerDirWindow(dir);
+  }
+  return { backupDir, removed };
+}
+
+/**
  * 安全写入一组文件（写回侧唯一推荐入口）。
  *
  * 流程：为每个已存在的目标文件做同目录备份 → 逐文件 registerInflight →

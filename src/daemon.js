@@ -3,9 +3,12 @@
  *
  * 职责：
  * - pid O_EXCL 锁（state/daemon.pid）：存在且进程活着则拒绝二次启动，陈旧锁自动清理；
- * - daemon 主循环（runDaemon）：启动 watcher 监听摄取 + 每 5 分钟尝试 distill（静默批量，
- *   LLM 未配置时优雅降级，绝不做崩溃重试风暴）+ 每 10 分钟尝试 writeback（仅当 wiki
- *   有新条目，且绝不传 forceBatch3 —— 一律遵守 config.writeback.batch3Enabled）；
+ * - daemon 主循环（runDaemon）：启动 watcher 监听摄取 + 事件驱动增量调度 ——
+ *   watcher 每次真实摄取喂入变更累计窗口，窗口内条数/体积达阈值即（静默合并后）
+ *   触发一轮 pipeline（distill → 有新页面立即 writeback，无需手动触发）；
+ *   低于阈值的零星变更留给每小时一次的兜底扫描；启动后自动对账追赶停机
+ *   期间的欠账。LLM 未配置时优雅降级，绝不做崩溃重试风暴；writeback 绝不传
+ *   forceBatch3 —— 一律遵守 config.writeback.batch3Enabled；
  * - 日志落 logs/daemon.log（启动、各轮次结果、错误；错误只记录不退出）；
  * - SIGINT/SIGTERM 优雅停止（停 watcher、清 pid、保存状态）；
  * - launchd plist 生成与 install/uninstall/start/stop/status 封装（可逆、幂等）。
@@ -29,10 +32,18 @@ import { appendLogEntry, rotateLogFile } from './util/log.js';
 /** launchd 服务标签 */
 export const LAUNCHD_LABEL = 'com.kuangju.memory-hub';
 
-/** distill 轮询间隔：5 分钟 */
-export const DISTILL_INTERVAL_MS = 5 * 60 * 1000;
-/** writeback 轮询间隔：10 分钟 */
-export const WRITEBACK_INTERVAL_MS = 10 * 60 * 1000;
+/** 兜底全量扫描间隔：1 小时（事件静默/低于阈值时的整理 + 写回幂等校验） */
+export const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+/** 事件触发阈值：窗口内摄取快照条数（达到即提前触发 pipeline） */
+export const TRIGGER_COUNT = 5;
+/** 事件触发阈值：窗口内摄取正文体积（字节估算） */
+export const TRIGGER_BYTES = 64 * 1024;
+/** 达阈值后的静默合并窗口：等编辑风暴平息再统一整理（每次新变更重置，省 token） */
+export const QUIET_MS = 2 * 60 * 1000;
+/** 达阈值后的最长推迟：持续编辑也不无限期推迟 */
+export const MAX_DELAY_MS = 10 * 60 * 1000;
+/** 启动追赶延迟：watcher 就绪后稍等稳定，再对账并补跑停机期间的欠账 */
+export const STARTUP_CATCHUP_MS = 30 * 1000;
 
 /** H3：连续启动失败上限，超过后主动 bootout 自身，终止 KeepAlive 重启风暴 */
 export const CRASH_LIMIT = 5;
@@ -506,14 +517,19 @@ export function sweepStaleTmpFiles(dirs) {
 /**
  * daemon 主循环（hub daemon run 的前台进程体，由 launchd 拉起）。
  *
- * 流程：pid O_EXCL 锁 → 启动 watcher → 定时器（5min distill / 10min writeback）
- * → SIGINT/SIGTERM 优雅停止（停 watcher、清 pid、保存状态）。
+ * 流程：pid O_EXCL 锁 → 启动 watcher（onIngest 喂入变更累计窗口）→ 事件驱动调度
+ * （窗口内条数/体积达阈值 → 静默合并 → pipeline：distill → 有新页面立即 writeback）
+ * + 每小时兜底扫描 + 启动追赶对账 → SIGINT/SIGTERM 优雅停止。
  * 错误一律记录日志后继续，不退出、不重试风暴。
  *
  * @param {{
  *   config?: Object,              // 配置；缺省 loadConfig()
- *   distillIntervalMs?: number,   // distill 轮询间隔（缺省 5 分钟）
- *   writebackIntervalMs?: number, // writeback 轮询间隔（缺省 10 分钟）
+ *   sweepIntervalMs?: number,     // 兜底扫描间隔（缺省 config.daemon.sweepIntervalMs / 1 小时）
+ *   triggerCount?: number,        // 窗口条数阈值（缺省 config.daemon.triggerCount / 5）
+ *   triggerBytes?: number,        // 窗口体积阈值（缺省 config.daemon.triggerBytes / 64KB）
+ *   quietMs?: number,             // 达阈值后静默合并窗口（缺省 config.daemon.quietMs / 2 分钟）
+ *   maxDelayMs?: number,          // 达阈值后最长推迟（缺省 config.daemon.maxDelayMs / 10 分钟）
+ *   startupCatchupMs?: number,    // 启动追赶延迟（缺省 30s）
  *   distillFn?: Function,         // 可注入（测试用）
  *   writebackFn?: Function,       // 可注入（测试用）
  *   degradedWarnIntervalMs?: number, // RV-O2：降级配置周期提醒间隔（缺省 30 分钟）
@@ -557,15 +573,121 @@ export async function runDaemon(opts = {}) {
   // 1. pid O_EXCL 锁：存在且进程活着则抛错（cli 层转 exit 1）
   acquirePidLock();
 
-  const distillMs = opts.distillIntervalMs ?? DISTILL_INTERVAL_MS;
-  const writebackMs = opts.writebackIntervalMs ?? WRITEBACK_INTERVAL_MS;
+  const dcfg = config.daemon || {};
+  const sweepMs = opts.sweepIntervalMs ?? dcfg.sweepIntervalMs ?? SWEEP_INTERVAL_MS;
+  const triggerCount = opts.triggerCount ?? dcfg.triggerCount ?? TRIGGER_COUNT;
+  const triggerBytes = opts.triggerBytes ?? dcfg.triggerBytes ?? TRIGGER_BYTES;
+  const quietMs = opts.quietMs ?? dcfg.quietMs ?? QUIET_MS;
+  const maxDelayMs = opts.maxDelayMs ?? dcfg.maxDelayMs ?? MAX_DELAY_MS;
+  const startupCatchupMs = opts.startupCatchupMs ?? STARTUP_CATCHUP_MS;
   const distillFn = opts.distillFn || distill;
   const writebackFn = opts.writebackFn || runWriteback;
 
-  logDaemon('info', `daemon 启动 pid=${process.pid} distill 间隔=${distillMs}ms writeback 间隔=${writebackMs}ms`);
+  logDaemon(
+    'info',
+    `daemon 启动 pid=${process.pid} 兜底扫描=${sweepMs}ms 触发阈值=${triggerCount}条/${triggerBytes}字节 静默窗口=${quietMs}ms 最长推迟=${maxDelayMs}ms`,
+  );
 
-  // 2. 启动 watcher（信号由 daemon 统一接管）
-  const watcher = new Watcher(config);
+  let stopping = false;
+
+  // 2. 事件驱动调度：变更累计窗口 + 静默合并 + 最长推迟兜底。
+  // 低于阈值的零星变更不单独触发（留给兜底扫描），避免频繁 LLM 调用烧 token。
+  const acc = { count: 0, bytes: 0 };
+  let quietTimer = null;
+  let deadlineTimer = null;
+  let startupTimer = null;
+  let pipelineBusy = false;
+  let pipelineRerun = false;
+
+  const clearTriggerTimers = () => {
+    if (quietTimer) {
+      clearTimeout(quietTimer);
+      quietTimer = null;
+    }
+    if (deadlineTimer) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  };
+
+  const firePipeline = (reason) => {
+    clearTriggerTimers();
+    runPipeline(reason); // 异步执行，异常内部消化
+  };
+
+  // watcher 每次真实摄取回调：累计窗口，达阈值后进入静默合并（每次新变更重置，
+  // deadline 保证持续编辑也不会无限期推迟）
+  const onIngest = (info) => {
+    if (stopping) return;
+    acc.count += info.count || 0;
+    acc.bytes += info.bytes || 0;
+    if (acc.count < triggerCount && acc.bytes < triggerBytes) return; // 低于阈值：等兜底扫描
+    if (quietTimer) clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => firePipeline('阈值触发'), quietMs);
+    if (quietTimer.unref) quietTimer.unref();
+    if (!deadlineTimer) {
+      deadlineTimer = setTimeout(() => firePipeline('阈值触发-最长推迟到期'), maxDelayMs);
+      if (deadlineTimer.unref) deadlineTimer.unref();
+    }
+  };
+
+  // pipeline：distill →（产出新页面立即）writeback，一气呵成，无需手动触发；
+  // 兜底轮（扫描/追赶）额外跑一次写回幂等校验，补齐上轮写回失败的欠账。
+  async function runPipeline(reason) {
+    if (stopping) return;
+    if (pipelineBusy) {
+      pipelineRerun = true; // 忙则记账，跑完立刻补一轮（变更已在窗口里，不丢）
+      return;
+    }
+    pipelineBusy = true;
+    const window = { count: acc.count, bytes: acc.bytes };
+    acc.count = 0;
+    acc.bytes = 0;
+    const isSweep = reason !== '阈值触发' && reason !== '阈值触发-最长推迟到期';
+    let hasBacklog = false; // 本轮受 maxBatches 限额未处理完的积压批次
+    try {
+      let distilledNew = false;
+      const r = await distillFn({ config });
+      if (!r.ok) {
+        logDaemon('warn', `[${reason}] distill 降级跳过（sources 保留，下轮再试）: ${r.error}`);
+      } else if (r.pending > 0) {
+        distilledNew = (r.written?.length ?? 0) > 0;
+        hasBacklog = Number.isFinite(r.totalBatches) && r.totalBatches > (r.batches ?? 0);
+        logDaemon(
+          'info',
+          `[${reason}] distill 完成: ${r.pending} 条快照（窗口累计 ${window.count} 条/${window.bytes} 字节）→ ${r.written?.length ?? 0} 个页面${hasBacklog ? `，尚余 ${r.totalBatches - r.batches} 批积压，稍后续跑` : ''}`,
+        );
+      }
+      // pending === 0 且非兜底轮时无事发生，不打扰日志
+
+      if (distilledNew || isSweep) {
+        const entries = wikiToEntries();
+        if (entries.length > 0) {
+          const w = await writebackFn({ config }); // 绝不传 forceBatch3，遵守 batch3Enabled 门禁
+          const summary = (w.appResults || []).map((a) => `${a.app}:${a.status}`).join(', ');
+          const noteworthy = (w.appResults || []).some((a) => a.status === 'written' || a.status === 'failed');
+          // 兜底轮全为幂等跳过时不刷日志，避免每小时一条噪音
+          if (noteworthy || distilledNew) {
+            logDaemon('info', `[${reason}] writeback 完成: ${entries.length} 条目（${summary || '无适配器'}）`);
+          }
+        }
+      }
+    } catch (err) {
+      logDaemon('error', `[${reason}] pipeline 异常: ${err.message}`);
+    } finally {
+      pipelineBusy = false;
+      if (pipelineRerun || (hasBacklog && !stopping)) {
+        // 积压未清（如停机欠账首次追赶）或运行期间又有触发：稍作喘息后续跑，
+        // 直到清底，不等下一个兜底扫描
+        pipelineRerun = false;
+        const t = setTimeout(() => runPipeline('补跑'), 5000);
+        if (t.unref) t.unref();
+      }
+    }
+  }
+
+  // 3. 启动 watcher（信号由 daemon 统一接管；onIngest 喂入变更累计窗口）
+  const watcher = new Watcher(config, { onIngest });
   watcher.start({ signals: false });
   const watchPaths = watcher.allWatchPaths();
   logDaemon('info', `watcher 监听 ${watchPaths.length} 个路径: ${watchPaths.join(' ; ') || '（无）'}`);
@@ -578,57 +700,10 @@ export async function runDaemon(opts = {}) {
     logDaemon('warn', `陈旧临时文件清扫异常: ${err.message}`);
   }
 
-  let stopping = false;
-
-  // 3. 定时 distill（静默批量；LLM 未配置/调用失败优雅降级，只记录不重试风暴）
-  // M7：busy 标志防两轮重叠（重叠轮次跳过并记日志）
-  let distillBusy = false;
-  const distillTimer = setInterval(async () => {
-    if (stopping) return;
-    if (distillBusy) {
-      logDaemon('warn', 'distill 上一轮仍在进行，跳过本轮');
-      return;
-    }
-    distillBusy = true;
-    try {
-      const r = await distillFn({ config });
-      if (!r.ok) {
-        logDaemon('warn', `distill 降级跳过（sources 保留，下轮再试）: ${r.error}`);
-      } else if (r.pending > 0) {
-        logDaemon('info', `distill 完成: ${r.pending} 条快照 → ${r.written?.length ?? 0} 个页面`);
-      }
-      // pending === 0 时无事发生，不打扰日志
-    } catch (err) {
-      logDaemon('error', `distill 异常: ${err.message}`);
-    } finally {
-      distillBusy = false;
-    }
-  }, distillMs);
-
-  // 4. 定时 writeback（仅当 wiki 有条目；绝不传 forceBatch3，遵守 batch3Enabled 门禁）
-  // M7：busy 标志防两轮重叠
-  let writebackBusy = false;
-  const writebackTimer = setInterval(async () => {
-    if (stopping) return;
-    if (writebackBusy) {
-      logDaemon('warn', 'writeback 上一轮仍在进行，跳过本轮');
-      return;
-    }
-    writebackBusy = true;
-    try {
-      const entries = wikiToEntries();
-      if (entries.length === 0) return; // wiki 无条目，不触发写回
-      const r = await writebackFn({ config });
-      const summary = (r.appResults || [])
-        .map((a) => `${a.app}:${a.status}`)
-        .join(', ');
-      logDaemon('info', `writeback 完成: ${entries.length} 条目（${summary || '无适配器'}）`);
-    } catch (err) {
-      logDaemon('error', `writeback 异常: ${err.message}`);
-    } finally {
-      writebackBusy = false;
-    }
-  }, writebackMs);
+  // 4. 兜底扫描：每 sweepMs 一轮（摄取层对账由 watcher 60s 轮询负责，这里补跑
+  // 低于阈值的零星变更整理 + 写回幂等校验，即“1 小时兜底”）
+  const sweepTimer = setInterval(() => firePipeline('兜底扫描'), sweepMs);
+  if (sweepTimer.unref) sweepTimer.unref();
 
   // 5. RV-O2：降级配置期间周期性重复提醒（缺省每 30 分钟），直到 config 恢复正常；
   //    恢复后热加载新配置（同一 config 对象引用，定时器闭包直接生效），
@@ -658,8 +733,9 @@ export async function runDaemon(opts = {}) {
     if (stopping) return;
     stopping = true;
     logDaemon('info', `收到 ${sig}，优雅停止`);
-    clearInterval(distillTimer);
-    clearInterval(writebackTimer);
+    clearInterval(sweepTimer);
+    clearTriggerTimers();
+    if (startupTimer) clearTimeout(startupTimer);
     if (degradedTimer) clearInterval(degradedTimer);
     try {
       await watcher.stop();
@@ -680,14 +756,29 @@ export async function runDaemon(opts = {}) {
   resetCrashCount();
   logDaemon('info', 'watcher 就绪，daemon 进入常驻循环');
 
+  // 7. 启动追赶：稍等稳定后先对账补摄取停机期间的变更，再补跑一轮 pipeline
+  // （无需手动 hub sync，停机欠账自动收敛）
+  startupTimer = setTimeout(() => {
+    startupTimer = null;
+    if (stopping) return;
+    try {
+      watcher.reconcile();
+    } catch (err) {
+      logDaemon('warn', `启动对账异常: ${err.message}`);
+    }
+    firePipeline('启动追赶');
+  }, startupCatchupMs);
+  if (startupTimer.unref) startupTimer.unref();
+
   return {
     watcher,
     /** 测试/内部用：不退出进程地停止全部资源 */
     async stop() {
       if (stopping) return;
       stopping = true;
-      clearInterval(distillTimer);
-      clearInterval(writebackTimer);
+      clearInterval(sweepTimer);
+      clearTriggerTimers();
+      if (startupTimer) clearTimeout(startupTimer);
       if (degradedTimer) clearInterval(degradedTimer);
       process.off('SIGINT', onSigint);
       process.off('SIGTERM', onSigterm);

@@ -26,6 +26,13 @@ import { paths, ensureDir, ensureHubDirs, FILE_MODE } from './util/paths.js';
 export const MAX_BACKUPS = 20;
 export const MAX_FULL_BACKUPS = 10;
 
+/**
+ * N3：新鲜备份保护窗口（毫秒）。窗口内的备份目录不参与限额淘汰：
+ * 单轮写回会逐条创建大量备份目录（可能远超池限额），若同轮早期备份被后续
+ * 写入触发的裁剪淘汰，verify 阶段回滚会因“找不到备份目录”失败。
+ */
+export const BACKUP_PROTECT_MS = 60 * 60 * 1000;
+
 /** 备份池名 */
 export const BACKUP_POOLS = ['full', 'writeback'];
 
@@ -103,13 +110,20 @@ export function listBackupDirs() {
   return dirs.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
 }
 
-/** 限额裁剪单个池（或遗留顶层）；limit<=0 时清空 */
+/** 限额裁剪单个池（或遗留顶层）；limit<=0 时清空。
+ * N3：mtime 在保护窗口内的新鲜备份不淘汰（防同轮写回的回滚依据被提前清理） */
 function pruneDirTo(root, limit) {
   const dirs = listDirsIn(root);
   const removed = [];
   const keep = Math.max(0, limit);
   if (dirs.length > keep) {
+    const cutoff = Date.now() - BACKUP_PROTECT_MS;
     for (const dir of dirs.slice(0, dirs.length - keep)) {
+      try {
+        if (fs.statSync(dir).mtimeMs > cutoff) continue; // 保护窗口内：跳过
+      } catch {
+        // 目录恰好消失：继续删除流程（rmSync force 容忍）
+      }
       fs.rmSync(dir, { recursive: true, force: true });
       removed.push(dir);
     }
@@ -191,15 +205,17 @@ export function backup(filePath) {
  * 供 rollback 清单按 app 分组展示与按内容特征清理改名文件（N2）。
  * @param {string} filePath 被备份文件的绝对路径
  * @param {string} dir 备份目录绝对路径
- * @param {{ app?: string, hubId?: string }} [extra] 需额外记入 manifest 的字段（undefined 字段忽略）
+ * @param {{ app?: string, hubId?: string, as?: string }} [extra] 需额外记入 manifest 的字段
+ *   （undefined 字段忽略）；as 可指定备份文件名（防同批次同名冲突，如 qoder 移动场景）
  * @returns {string|null} 备份后的文件路径；源文件不存在时返回 null
  */
 export function backupTo(filePath, dir, extra = {}) {
   ensureDir(dir);
-  const name = path.basename(filePath);
+  const { as, ...rest } = extra;
+  const name = as || path.basename(filePath);
   // 过滤 undefined 字段，避免污染 manifest
   const extraFields = {};
-  for (const [k, v] of Object.entries(extra)) {
+  for (const [k, v] of Object.entries(rest)) {
     if (v !== undefined && v !== null) extraFields[k] = v;
   }
   if (!fs.existsSync(filePath)) {
@@ -412,6 +428,17 @@ export function rollback(backupDir, pathMap) {
     restored.push({ from: null, to: target, missing: true });
   }
   return restored;
+}
+
+/**
+ * 按备份目录内 manifest 记录的 origin 路径整体回滚（M8：写回引擎在 adapter.verify()
+ * 失败时调用，无需调用方自行构造 pathMap）。
+ * @param {string} backupDir 备份目录绝对路径
+ * @returns {ReturnType<typeof rollback>} rollback() 的恢复清单
+ */
+export function rollbackByManifest(backupDir) {
+  const manifest = readBackupManifest(backupDir);
+  return rollback(backupDir, (name) => manifest[name]?.origin);
 }
 
 /**

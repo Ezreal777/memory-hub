@@ -185,18 +185,18 @@ test('hub status：隔离环境输出一屏汇总（app/daemon/distill/writeback
   loadConfig();
   updateApp('claude', { enabled: true, memory_paths: ['/tmp/fake-memory'] });
 
-  // 种子数据：watcher.log / distill-state / writeback-log / 一个备份目录
+  // 种子数据：watcher.log / distill-state / writeback-log / 一个备份目录（内部状态已迁至底层 paths.state）
   fs.appendFileSync(path.join(paths.logs, 'watcher.log'), '2026-08-06T10:00:00.000Z\tclaude\tadd 摄取 1 条快照\t/tmp/fake-memory/x.md\n');
-  fs.mkdirSync(path.join(paths.hub, 'state'), { recursive: true });
+  fs.mkdirSync(paths.state, { recursive: true });
   fs.writeFileSync(
-    path.join(paths.hub, 'state', 'distill-state.json'),
+    path.join(paths.state, 'distill-state.json'),
     JSON.stringify({ version: 1, processed: { 'hub-a': { page: 'p', at: '' }, 'hub-b': { page: 'p', at: '' } } }),
   );
   const log = [];
   for (let i = 1; i <= 6; i += 1) {
     log.push({ time: `2026-08-06T0${i}:00:00.000Z`, app: 'claude', hubId: `hub-${i}`, result: 'written', backupDir: null });
   }
-  fs.writeFileSync(path.join(paths.hub, 'state', 'writeback-log.json'), JSON.stringify(log));
+  fs.writeFileSync(path.join(paths.state, 'writeback-log.json'), JSON.stringify(log));
   fs.mkdirSync(path.join(paths.backups, '2026-08-06T00-00-00-000Z'), { recursive: true });
 
   // launchctl 桩：未注册
@@ -379,7 +379,7 @@ test('N4：写回自身备份的 manifest 记录 app 归属；rollback 清单按
 // 7. daemon 主循环（持锁 / 拒绝二次启动 / 优雅停止）
 // ---------------------------------------------------------------------------
 
-test('daemon 主循环：启动持锁、二次启动拒绝、优雅停止释放锁、日志落盘', async () => {
+test('daemon 主循环：启动持锁、二次启动拒绝、兜底扫描触发、优雅停止释放锁、日志落盘', async () => {
   freshHubRoot();
   const watchDir = freshTmpDir('mh-cli-watch-');
   loadConfig();
@@ -388,8 +388,8 @@ test('daemon 主循环：启动持锁、二次启动拒绝、优雅停止释放�
   let distillCalls = 0;
   const handle = await runDaemon({
     config: loadConfig(),
-    distillIntervalMs: 40,
-    writebackIntervalMs: 40,
+    sweepIntervalMs: 40,
+    startupCatchupMs: 60 * 60 * 1000, // 启动追赶推到测试外，只验兜底扫描
     distillFn: async () => {
       distillCalls += 1;
       return { ok: false, error: 'llm.baseUrl / llm.model 未配置（测试降级）' };
@@ -408,14 +408,71 @@ test('daemon 主循环：启动持锁、二次启动拒绝、优雅停止释放�
     /已在运行/,
   );
 
-  // 等定时器至少触发一轮：distill 降级只记日志不退出、不重试风暴
+  // 等兜底扫描至少触发一轮：distill 降级只记日志不退出、不重试风暴
   await new Promise((r) => setTimeout(r, 120));
-  assert.ok(distillCalls >= 1, 'distill 定时器应至少触发一轮');
+  assert.ok(distillCalls >= 1, '兜底扫描应至少触发一轮 distill');
   assert.match(fs.readFileSync(daemonLogPath(), 'utf8'), /distill 降级跳过/);
 
   // 优雅停止：释放 pid 锁
   await handle.stop();
   assert.equal(fs.existsSync(daemonPidPath()), false);
+});
+
+test('daemon 事件驱动：低于阈值不触发，达阈值静默合并后触发 distill 并链式 writeback', async () => {
+  freshHubRoot();
+  const watchDir = freshTmpDir('mh-cli-trigger-');
+  loadConfig();
+  updateApp('claude', { enabled: true, memory_paths: [watchDir] });
+
+  // 预置一个带 hub-id 的 wiki 页，让链式 writeback 有可写回条目
+  const wikiDir = path.join(paths.hub, 'wiki');
+  fs.mkdirSync(wikiDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(wikiDir, 'trigger-page.md'),
+    '---\nhub-id: hub-trigger-1\n---\n# 触发测试页\n\n正文。\n',
+  );
+
+  let distillCalls = 0;
+  let writebackCalls = 0;
+  const handle = await runDaemon({
+    config: loadConfig(),
+    sweepIntervalMs: 60 * 60 * 1000, // 兜底扫描推到测试外，只验事件触发
+    startupCatchupMs: 60 * 60 * 1000,
+    triggerCount: 3,
+    triggerBytes: 1024 * 1024,
+    quietMs: 30,
+    maxDelayMs: 10 * 1000,
+    distillFn: async () => {
+      distillCalls += 1;
+      return { ok: true, pending: 3, written: [path.join(wikiDir, 'trigger-page.md')] };
+    },
+    writebackFn: async () => {
+      writebackCalls += 1;
+      return { appResults: [{ app: 'claude', status: 'written' }] };
+    },
+  });
+
+  // 低于阈值（2 < 3）：静默窗口过后也不触发（留给兜底扫描）
+  handle.watcher.notifyIngest({ app: 'claude', count: 1, bytes: 10 });
+  handle.watcher.notifyIngest({ app: 'claude', count: 1, bytes: 10 });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(distillCalls, 0, '低于阈值不得触发 distill');
+
+  // 第三条达阈值 → 静默合并 30ms 后触发一轮 pipeline（distill + 链式 writeback）
+  handle.watcher.notifyIngest({ app: 'claude', count: 1, bytes: 10 });
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(distillCalls, 1, '达阈值后应触发一轮 distill（静默合并为一次）');
+  assert.equal(writebackCalls, 1, 'distill 产出新页面后应立即链式 writeback，无需手动触发');
+  const log = fs.readFileSync(daemonLogPath(), 'utf8');
+  assert.match(log, /\[阈值触发\] distill 完成/);
+  assert.match(log, /\[阈值触发\] writeback 完成/);
+
+  // 窗口已清零：后续零星变更不再重复触发
+  handle.watcher.notifyIngest({ app: 'claude', count: 1, bytes: 10 });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(distillCalls, 1, '触发后窗口清零，零星变更不得重复触发');
+
+  await handle.stop();
 });
 
 // ---------------------------------------------------------------------------
@@ -429,8 +486,8 @@ test('RV-O2：config 损坏降级期间周期性重复 warn，修复后热加载
   fs.writeFileSync(paths.config, '{ 非法 JSON');
 
   const handle = await runDaemon({
-    distillIntervalMs: 60 * 60 * 1000, // 长间隔，排除干扰
-    writebackIntervalMs: 60 * 60 * 1000,
+    sweepIntervalMs: 60 * 60 * 1000, // 长间隔，排除干扰
+    startupCatchupMs: 60 * 60 * 1000,
     degradedWarnIntervalMs: 30,
     distillFn: async () => ({ ok: true, pending: 0 }),
     writebackFn: async () => ({ appResults: [] }),

@@ -127,28 +127,47 @@ test('H2b：preStat 一致时正常写入', async () => {
 // H2c：claude 索引自愈
 // ---------------------------------------------------------------------------
 
-test('H2c：条目文件已含 hubId 但 MEMORY.md 缺索引行 → 补写索引（自愈）', async () => {
+test('H2c：条目文件已含 hubId 且内容无变但 MEMORY.md 缺索引行 → 补写索引（自愈）', async () => {
   const { ClaudeAdapter } = await import('../src/adapters/claude.js');
   freshHubRoot();
   const memDir = freshTmpDir('mh-rv-h2c-');
-  // 已存在的条目文件（frontmatter 含 hubId），但索引里没有它的行
-  writeAt(memDir, 'entry-a.md', [
-    '---',
-    'name: "entry a"',
-    'metadata:',
-    '  hubId: hub-heal-1',
-    '---',
-    '既有正文',
-  ].join('\n'));
-  writeAt(memDir, 'MEMORY.md', '# Memory\n- [别的条目](other.md) — 摘要\n');
   const adapter = new ClaudeAdapter({ id: 'claude', enabled: true, memory_paths: [memDir] });
-  const results = await adapter.write([{ hubId: 'hub-heal-1', title: 'entry a', body: '既有正文' }]);
+  const entry = { hubId: 'hub-heal-1', title: 'entry a', body: '既有正文' };
+  // 已存在的条目文件（与 render 输出完全一致 = 内容无变），但索引里没有它的行
+  writeAt(memDir, 'entry-a.md', adapter.render(entry));
+  writeAt(memDir, 'MEMORY.md', '# Memory\n- [别的条目](other.md) — 摘要\n');
+  const results = await adapter.write([entry]);
   assert.equal(results.length, 1);
   assert.equal(results[0].status, 'written');
   assert.match(String(results[0].reason || ''), /自愈/);
   const index = fs.readFileSync(path.join(memDir, 'MEMORY.md'), 'utf8');
   assert.ok(index.includes('(entry-a.md)'), '索引行必须被补写');
   assert.ok(index.includes('- [别的条目](other.md)'), '索引既有行绝不重写');
+});
+
+test('claude 更新路径：条目已含 hubId 但内容有变化 → 重写条目并原位替换索引行（不重复追加）', async () => {
+  const { ClaudeAdapter } = await import('../src/adapters/claude.js');
+  freshHubRoot();
+  const memDir = freshTmpDir('mh-rv-upd-');
+  const adapter = new ClaudeAdapter({ id: 'claude', enabled: true, memory_paths: [memDir] });
+  const oldEntry = { hubId: 'hub-upd-1', title: 'entry a', body: '旧版正文：用户名字是狂且' };
+  // 先正常写入一次，制造已存在条目 + 索引行
+  await adapter.write([oldEntry]);
+  // 同 hubId、内容更新（wiki 页归并了新快照）
+  const newEntry = { hubId: 'hub-upd-1', title: 'entry a', body: '新版正文：用户名字是三川' };
+  const results = await adapter.write([newEntry]);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].status, 'written');
+  assert.match(String(results[0].reason || ''), /内容有更新/);
+  const body = fs.readFileSync(path.join(memDir, 'entry-a.md'), 'utf8');
+  assert.ok(body.includes('三川'), '条目正文必须已更新');
+  assert.ok(!body.includes('狂且'), '旧正文不应残留');
+  const index = fs.readFileSync(path.join(memDir, 'MEMORY.md'), 'utf8');
+  const lines = index.split('\n').filter((l) => l.includes('(entry-a.md)'));
+  assert.equal(lines.length, 1, '索引行必须原位替换，不得重复追加');
+  // 重放同内容 → 幂等跳过
+  const replay = await adapter.write([newEntry]);
+  assert.equal(replay[0].status, 'skipped');
 });
 
 // ---------------------------------------------------------------------------
@@ -239,15 +258,30 @@ test('M2：备份分池（full/writeback 各自限额，latestBackupDir 优先 f
   const all = listBackupDirs();
   assert.ok(all.includes(fullDir) && all.includes(wbDir));
 
-  // full 池限额 10：造 12 份后 prune 只留 10
+  // full 池限额 10：造 12 份后 prune 只留 10（N3：新鲜备份受保护窗口保护，
+  // 需先把 mtime 做旧到窗口外才会被淘汰）
   for (let i = 0; i < 10; i += 1) {
     const d = createBackupDir('full');
     fs.writeFileSync(path.join(d, 'manifest.json'), '{}');
+  }
+  const staleTime = new Date(Date.now() - 2 * 60 * 60 * 1000); // 2 小时前，超出保护窗口
+  for (const n of fs.readdirSync(backupPoolDir('full'))) {
+    fs.utimesSync(path.join(backupPoolDir('full'), n), staleTime, staleTime);
   }
   pruneBackups();
   const fulls = fs.readdirSync(backupPoolDir('full')).filter((n) => !n.startsWith('.'));
   assert.equal(fulls.length, 10, `full 池应限额 10 份，实际 ${fulls.length}`);
   assert.ok(fs.existsSync(paths.backups), 'backups 根目录存在');
+
+  // N3：保护窗口内的新鲜备份不被淘汰（全部刷新为新鲜 + 超限额，prune 不动任何目录）
+  const freshTime = new Date();
+  for (const n of fs.readdirSync(backupPoolDir('full'))) {
+    fs.utimesSync(path.join(backupPoolDir('full'), n), freshTime, freshTime);
+  }
+  for (let i = 0; i < 3; i += 1) createBackupDir('full');
+  pruneBackups();
+  const fullsAfter = fs.readdirSync(backupPoolDir('full')).filter((n) => !n.startsWith('.'));
+  assert.equal(fullsAfter.length, 13, `新鲜备份受保护不淘汰，实际 ${fullsAfter.length}`);
 });
 
 // ---------------------------------------------------------------------------

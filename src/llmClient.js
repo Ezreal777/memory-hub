@@ -5,14 +5,28 @@
  * - baseUrl / model 由 config.llm 提供，apiKey 由 keys.resolveApiKey() 从 Keychain 解析；
  * - fetch 可注入（opts.fetchImpl），便于单测 mock，不打真实网络；
  * - 请求带 AbortController 超时保护；
+ * - M3：瞬时故障（429/5xx/网络错误/超时）按指数退避自动重试 2 次（共 3 次尝试），
+ *   重试间隔可注入（opts.retryDelaysMs），4xx 业务错误不重试；
+ * - M5：网关请求体超限（HTTP 413 或响应体含 TooLarge）抛出带 tooLarge 标记的错误，
+ *   供上层（distill）对批次做对半拆分重试，绝不原地重放；
  * - 任何错误信息与日志绝不包含明文密钥（Authorization 头不落日志、不回显）。
  */
 
 /** LLM 配置/调用类错误（区别于解析错误），供上层统一降级处理 */
 export class LlmError extends Error {
-  constructor(message) {
+  /**
+   * @param {string} message 错误信息（绝不含密钥）
+   * @param {{ status?: number|null, retryable?: boolean, tooLarge?: boolean }} [meta]
+   */
+  constructor(message, meta = {}) {
     super(message);
     this.name = 'LlmError';
+    /** HTTP 状态码（网络层失败为 null） */
+    this.status = meta.status ?? null;
+    /** 是否值得原样重试（429/5xx/网络错误/超时） */
+    this.retryable = Boolean(meta.retryable);
+    /** 请求体超网关上限（上层应拆分批次而非重试） */
+    this.tooLarge = Boolean(meta.tooLarge);
   }
 }
 
@@ -20,6 +34,16 @@ export class LlmError extends Error {
 export const LLM_CONFIG_HINT =
   '请编辑 config.json 的 llm 段填写 baseUrl/model（hub config 查看配置文件路径），' +
   '并运行 hub keys --sync 与 hub keys use <name> 将密钥存入 Keychain 后选择引用名';
+
+/** 缺省重试退避序列（指数放大）：第 1 次失败等 500ms，第 2 次等 2s，之后放弃 */
+export const LLM_RETRY_DELAYS_MS = [500, 2000];
+
+/** 异步休眠 */
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 /**
  * 创建一个 OpenAI 兼容的 chat completion 客户端。
@@ -29,11 +53,13 @@ export const LLM_CONFIG_HINT =
  *   apiKey: string,             // 明文密钥（仅存于进程内存，绝不落日志）
  *   fetchImpl?: Function,       // 可注入的 fetch（测试 mock 用），缺省全局 fetch
  *   timeoutMs?: number,         // 单次请求超时，缺省 120s
+ *   retryDelaysMs?: number[],   // 重试退避序列（测试可注入 [1,1] 加速），缺省 LLM_RETRY_DELAYS_MS
  * }} opts
  * @returns {{ chat: (messages: Object[], extra?: Object) => Promise<string>, baseUrl: string, model: string }}
  */
 export function createLlmClient(opts = {}) {
   const { baseUrl, model, apiKey, fetchImpl, timeoutMs = 120000 } = opts;
+  const retryDelaysMs = Array.isArray(opts.retryDelaysMs) ? opts.retryDelaysMs : LLM_RETRY_DELAYS_MS;
   if (!baseUrl) {
     throw new LlmError(`llm.baseUrl 未配置，无法调用 LLM。${LLM_CONFIG_HINT}`);
   }
@@ -50,13 +76,13 @@ export function createLlmClient(opts = {}) {
   const endpoint = `${String(baseUrl).replace(/\/+$/, '')}/chat/completions`;
 
   /**
-   * 发起一次 chat completion 调用，返回助手回复文本。
+   * 发起单次 chat completion 调用（不含重试），返回助手回复文本。
    * @param {{ role: string, content: string }[]} messages 对话消息
-   * @param {{ temperature?: number, maxTokens?: number }} [extra] 透传参数
+   * @param {{ temperature?: number, maxTokens?: number }} extra 透传参数
    * @returns {Promise<string>} choices[0].message.content
    * @throws {LlmError} 网络/HTTP/响应结构异常时抛出（错误文本不含密钥）
    */
-  async function chat(messages, extra = {}) {
+  async function chatOnce(messages, extra = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let resp;
@@ -77,7 +103,8 @@ export function createLlmClient(opts = {}) {
       });
     } catch (err) {
       const reason = err?.name === 'AbortError' ? `超时（${timeoutMs}ms）` : err.message;
-      throw new LlmError(`LLM 请求失败（${endpoint}）: ${reason}`);
+      // 网络错误/超时：瞬时故障概率高，标记可重试
+      throw new LlmError(`LLM 请求失败（${endpoint}）: ${reason}`, { retryable: true });
     } finally {
       clearTimeout(timer);
     }
@@ -90,7 +117,11 @@ export function createLlmClient(opts = {}) {
       } catch {
         snippet = '(响应体不可读)';
       }
-      throw new LlmError(`LLM 返回 HTTP ${resp.status}: ${snippet}`);
+      const status = Number(resp.status);
+      // M5：请求体超网关上限（413 或响应体含 TooLarge）→ 上层拆分批次，重试无意义
+      const tooLarge = status === 413 || /TooLarge|too\s*large/i.test(snippet);
+      const retryable = !tooLarge && (status === 429 || status >= 500);
+      throw new LlmError(`LLM 返回 HTTP ${status}: ${snippet}`, { status, retryable, tooLarge });
     }
 
     let data;
@@ -104,6 +135,28 @@ export function createLlmClient(opts = {}) {
       throw new LlmError('LLM 响应缺少 choices[0].message.content');
     }
     return content;
+  }
+
+  /**
+   * 发起一次 chat completion 调用（含 M3 指数退避重试），返回助手回复文本。
+   * 仅对 retryable 错误（429/5xx/网络错误/超时）重试；TooLarge 与其余 4xx 立即抛出。
+   * @param {{ role: string, content: string }[]} messages 对话消息
+   * @param {{ temperature?: number, maxTokens?: number }} [extra] 透传参数
+   * @returns {Promise<string>} choices[0].message.content
+   * @throws {LlmError} 重试耗尽或不可重试错误
+   */
+  async function chat(messages, extra = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+      try {
+        return await chatOnce(messages, extra);
+      } catch (err) {
+        lastErr = err;
+        if (!err?.retryable || attempt === retryDelaysMs.length) throw err;
+        await sleep(retryDelaysMs[attempt]);
+      }
+    }
+    throw lastErr;
   }
 
   return { chat, baseUrl, model };

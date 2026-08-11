@@ -8,11 +8,15 @@
  *
  * launchd.out/err.log 由 launchd 直接追加、进程无法拦截，
  * 由 daemon 启动时调用 rotateLogFile 做一次同策略轮转。
+ *
+ * 双写镜像：写入 paths.logs（底层权威份，防桌面误删）的日志，
+ * 同步镜像一份到桌面 paths.userLogs 供用户直接查看；
+ * 镜像失败同样静默，且不影响权威份落盘。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureDir } from './paths.js';
+import { ensureDir, paths } from './paths.js';
 
 /** 单个日志文件滚动阈值：5MB */
 export const LOG_MAX_BYTES = 5 * 1024 * 1024;
@@ -47,14 +51,32 @@ export function rotateLogFile(file, opts = {}) {
 
 /**
  * 追加一条日志（先按需滚动，再 appendFileSync）。失败静默。
+ * 写的是底层权威份（paths.logs 下）时，同步镜像一份到桌面 paths.userLogs。
  * @param {string} file 日志文件绝对路径
  * @param {string} line 完整日志行（调用方自行拼好时间戳/级别）
  */
 export function appendLogEntry(file, line) {
+  const text = line.endsWith('\n') ? line : `${line}\n`;
+  appendOne(file, text);
+  try {
+    if (path.dirname(file) === paths.logs && paths.userLogs !== paths.logs) {
+      appendOne(path.join(paths.userLogs, path.basename(file)), text);
+    }
+  } catch {
+    // 镜像失败不影响主流程
+  }
+}
+
+/**
+ * 向单个日志文件追加（含按需滚动）。失败静默。
+ * @param {string} file 日志文件绝对路径
+ * @param {string} text 已带换行符的日志文本
+ */
+function appendOne(file, text) {
   try {
     ensureDir(path.dirname(file));
     rotateLogFile(file);
-    fs.appendFileSync(file, line.endsWith('\n') ? line : `${line}\n`);
+    fs.appendFileSync(file, text);
   } catch {
     // 日志失败不影响主流程
   }

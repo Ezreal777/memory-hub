@@ -4,6 +4,9 @@
  * 约定：
  * - 数据根目录为 ~/.memory-hub/（一律通过 os.homedir() 拼接，禁止硬编码用户路径）。
  * - 支持环境变量 MEMORY_HUB_ROOT 覆盖根目录（仅供测试/隔离场景使用）。
+ * - 用户可视目录为 ~/Desktop/Memory Hub/（sources/wiki/_index + logs 镜像），
+ *   可用 MEMORY_HUB_USER_ROOT 覆盖；设置了 MEMORY_HUB_ROOT 时自动落回其 hub 子目录，
+ *   保证测试/隔离场景绝不写真实桌面。
  * - 所有目录惰性创建：首次访问时才 mkdir，目录权限 700。
  */
 
@@ -22,6 +25,17 @@ export const FILE_MODE = 0o600;
  */
 export function hubRoot() {
   return process.env.MEMORY_HUB_ROOT || path.join(os.homedir(), '.memory-hub');
+}
+
+/**
+ * 获取用户可视根目录（用户可直接浏览/交互的文件都放这里）。
+ * 优先级：MEMORY_HUB_USER_ROOT > MEMORY_HUB_ROOT/hub（隔离场景兜底）> ~/Desktop/Memory Hub。
+ * @returns {string} 用户可视根目录绝对路径
+ */
+export function userRoot() {
+  if (process.env.MEMORY_HUB_USER_ROOT) return process.env.MEMORY_HUB_USER_ROOT;
+  if (process.env.MEMORY_HUB_ROOT) return path.join(process.env.MEMORY_HUB_ROOT, 'hub');
+  return path.join(os.homedir(), 'Desktop', 'Memory Hub');
 }
 
 /**
@@ -45,9 +59,13 @@ export const paths = {
   get logs() {
     return path.join(hubRoot(), 'logs');
   },
-  /** 中转站内容目录 ~/.memory-hub/hub */
+  /** 中转站内容目录（用户可视）~/Desktop/Memory Hub */
   get hub() {
-    return path.join(hubRoot(), 'hub');
+    return userRoot();
+  },
+  /** 桌面日志镜像目录 ~/Desktop/Memory Hub/logs（仅供查看，权威份在 paths.logs） */
+  get userLogs() {
+    return path.join(userRoot(), 'logs');
   },
   /** 状态目录（游标/指纹等） ~/.memory-hub/state */
   get state() {
@@ -69,13 +87,14 @@ export function ensureDir(dirPath, mode = DIR_MODE) {
 }
 
 /**
- * 惰性创建数据根目录下的全部子目录（root/backups/logs/hub/state）。
+ * 惰性创建数据根目录下的全部子目录（root/backups/logs/state）与用户可视目录（hub/userLogs）。
  * 幂等：已存在时仅校正权限。
  */
 export function ensureHubDirs() {
   ensureDir(paths.root);
   ensureDir(paths.backups);
   ensureDir(paths.logs);
-  ensureDir(paths.hub);
   ensureDir(paths.state);
+  ensureDir(paths.hub);
+  ensureDir(paths.userLogs);
 }

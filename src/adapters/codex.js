@@ -11,7 +11,18 @@
  * - 在文件末尾维护 `<!-- memory-hub:start -->` 与 `<!-- memory-hub:end -->` 标记区；
  * - 区内每条 `### <标题> [hub-id]` + 正文；区外内容永不触碰；
  * - 区内更新用「整区重写」（读旧区 → 按 hub-id 合并替换 → 原子写），区不存在则追加创建；
- * - 幂等：同 hub-id 重写不重复；合并后内容与原文完全一致时跳过写入。
+ * - 幂等：同 hub-id 重写不重复；合并后内容与原文完全一致时跳过写入；
+ * - H1 多标记区自愈：历史坏文件可能含多个标记区（旧版只认首区，其余永久残留并
+ *   积累重复块）——写路径发现 >1 个区时先提取全部区内块、按 hub-id 去重（保留最后
+ *   出现的版本）、在首区位置重建单一区、移除其余区；verify 断言标记区计数必须为 1
+ *   且无孤儿标记；
+ * - Task#9 收敛增强（清理实战反馈：孤儿 end 多于 start、区外散落写回块）：repair 时
+ *   一并清除全部无法配对的孤儿 start/end 标记行（连同紧邻空行规整，计 orphanMarkers），
+ *   区外符合 `### 标题 [hub-…]` 特征的遗留块按保守边界（标题行到下一个标题/标记/文件尾）
+ *   归并进重建的单一区参与 hub-id 去重（区内版本优先）；无法安全判定边界（如代码围栏
+ *   未闭合）的只列入 strayBlocks 清单不动原文；非 hub- 前缀 id 的用户伪块与代码围栏内
+ *   的内容永不触碰；clean 判定收紧为「区数≤1 且无孤儿标记 且无可归并区外块」；
+ *   独立导出 repairFile() 供 CLI `hub writeback --repair` 接线（本模块不主动触碰真实文件）。
  */
 
 import fs from 'node:fs';
@@ -49,21 +60,315 @@ export function parseRegionBlocks(regionBody) {
 }
 
 /**
- * 从全文中抽取标记区：返回区前/区内/区后三段；无标记区时 region 为 null。
+ * 找出全文中【全部】成对标记区（H1：不再只认首个）。
+ * 孤立的 start（其后再无 end）不构成区，视为区外内容忽略。
  * @param {string} content AGENTS.md 全文
- * @returns {{ before: string, region: string|null, after: string }}
+ * @returns {{ start: number, end: number, body: string }[]}
+ *   start/end 为含首尾标记行的全文偏移（end 为区尾标记之后的偏移），body 为区内文本
+ */
+export function findHubRegions(content) {
+  const regions = [];
+  let idx = 0;
+  for (;;) {
+    const start = content.indexOf(HUB_MARK_START, idx);
+    if (start === -1) break;
+    const bodyStart = start + HUB_MARK_START.length;
+    const end = content.indexOf(HUB_MARK_END, bodyStart);
+    if (end === -1) break;
+    regions.push({ start, end: end + HUB_MARK_END.length, body: content.slice(bodyStart, end) });
+    idx = end + HUB_MARK_END.length;
+  }
+  return regions;
+}
+
+/**
+ * 从全文中抽取标记区：返回区前/区内/区后三段；无标记区时 region 为 null。
+ * H1：多区时 before/region/after 仍按首区切分，并附 count 供调用方判定是否需自愈。
+ * @param {string} content AGENTS.md 全文
+ * @returns {{ before: string, region: string|null, after: string, count: number }}
  */
 export function splitHubRegion(content) {
-  const startIdx = content.indexOf(HUB_MARK_START);
-  const endIdx = content.indexOf(HUB_MARK_END);
-  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) {
-    return { before: content, region: null, after: '' };
+  const regions = findHubRegions(content);
+  if (regions.length === 0) {
+    return { before: content, region: null, after: '', count: 0 };
   }
-  const before = content.slice(0, startIdx);
-  const regionStart = startIdx + HUB_MARK_START.length;
-  const region = content.slice(regionStart, endIdx);
-  const after = content.slice(endIdx + HUB_MARK_END.length);
-  return { before, region, after };
+  const first = regions[0];
+  return {
+    before: content.slice(0, first.start),
+    region: first.body,
+    after: content.slice(first.end),
+    count: regions.length,
+  };
+}
+
+/** 任意级别标题行（区外遗留块的保守边界判定用） */
+const HEADING_LINE_RE = /^#{1,6}\s/;
+/** 代码围栏开合行（围栏内的伪块/标记属用户内容，永不触碰） */
+const FENCE_RE = /^(```|~~~)/;
+
+/** 统计子串出现次数。 */
+function countOccurrences(text, needle) {
+  return text.split(needle).length - 1;
+}
+
+/** 剔除块文本中残留的标记（整行标记删行，行内嵌标记剥子串），返回 trim 后文本。 */
+function stripMarkerText(text) {
+  return text
+    .split('\n')
+    .map((line) => {
+      const t = line.trim();
+      if (t === HUB_MARK_START || t === HUB_MARK_END) return null;
+      return line.replaceAll(HUB_MARK_START, '').replaceAll(HUB_MARK_END, '');
+    })
+    .filter((line) => line !== null)
+    .join('\n')
+    .trim();
+}
+
+/**
+ * 紧邻空行规整：删行后若删除点之前已是空行（或段首），吞掉后续连续空行，
+ * 避免修复结果留下连续空行。返回调整后的行游标。
+ */
+function skipFollowingBlanks(lines, i, out) {
+  if (out.length > 0 && out[out.length - 1].trim() !== '') return i;
+  let j = i;
+  while (j + 1 < lines.length && lines[j + 1].trim() === '') j += 1;
+  return j;
+}
+
+/**
+ * 从区外文本中收集一个疑似遗留写回块：保守边界 = 标题行到下一个标题行/标记行/段尾。
+ * 块内代码围栏保持配对跟踪（围栏内的标题/标记不作边界）；扫描到段尾时围栏仍未闭合
+ * 则判定「无法安全确定边界」（safe=false），调用方只列清单不动原文。
+ * @param {string[]} lines 段内行数组
+ * @param {number} start 标题行下标
+ * @returns {{ endIndex: number, text: string, safe: boolean, reason?: string }}
+ */
+function collectStrayBlock(lines, start) {
+  const body = [lines[start]];
+  let fenceOpen = false;
+  let j = start + 1;
+  for (; j < lines.length; j += 1) {
+    const t = lines[j].trim();
+    if (FENCE_RE.test(t)) {
+      fenceOpen = !fenceOpen;
+      body.push(lines[j]);
+      continue;
+    }
+    if (
+      !fenceOpen &&
+      (HEADING_LINE_RE.test(lines[j]) || lines[j].includes(HUB_MARK_START) || lines[j].includes(HUB_MARK_END))
+    ) {
+      break;
+    }
+    body.push(lines[j]);
+  }
+  if (fenceOpen) {
+    return { endIndex: j, text: '', safe: false, reason: '代码围栏未闭合，无法安全判定块边界' };
+  }
+  return { endIndex: j, text: body.join('\n').trim(), safe: true };
+}
+
+/**
+ * 清理一段区外文本：移除孤儿 start/end 标记行（连同紧邻空行规整）、提取可安全归并的
+ * 区外 hub 块。保守原则：代码围栏内的内容一律不触碰（用户示例保护）；标题行 id 非
+ * `hub-` 前缀的用户伪块不触碰；无法安全判定边界的块只列入 stray 清单原文保留。
+ * @param {string} segment 区外文本段
+ * @returns {{ text: string, orphanMarkers: number,
+ *   merged: { hubId: string, title: string, text: string }[],
+ *   stray: { hubId: string, title: string, reason: string }[] }}
+ */
+function cleanOutsideSegment(segment) {
+  const lines = segment.split('\n');
+  const out = [];
+  let orphanMarkers = 0;
+  const merged = [];
+  const stray = [];
+  let inFence = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const t = line.trim();
+    if (FENCE_RE.test(t)) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+    if (inFence) {
+      out.push(line);
+      continue;
+    }
+    if (t === HUB_MARK_START || t === HUB_MARK_END) {
+      // 孤儿标记整行移除
+      orphanMarkers += 1;
+      i = skipFollowingBlanks(lines, i, out);
+      continue;
+    }
+    if (line.includes(HUB_MARK_START) || line.includes(HUB_MARK_END)) {
+      // 行内嵌标记（罕见）：只剥标记子串，行内其余文本保留
+      orphanMarkers += countOccurrences(line, HUB_MARK_START) + countOccurrences(line, HUB_MARK_END);
+      const rest = line.replaceAll(HUB_MARK_START, '').replaceAll(HUB_MARK_END, '');
+      if (rest.trim()) {
+        out.push(rest);
+      } else {
+        i = skipFollowingBlanks(lines, i, out);
+      }
+      continue;
+    }
+    const m = line.match(BLOCK_TITLE_RE);
+    if (m && m[2].startsWith('hub-')) {
+      const blk = collectStrayBlock(lines, i);
+      if (blk.safe) {
+        merged.push({ hubId: m[2], title: m[1].trim(), text: stripMarkerText(blk.text) });
+        i = skipFollowingBlanks(lines, blk.endIndex - 1, out);
+      } else {
+        stray.push({ hubId: m[2], title: m[1].trim(), reason: blk.reason });
+        out.push(line); // 不动原文：标题行原样保留，后续行走常规扫描
+      }
+      continue;
+    }
+    out.push(line);
+  }
+  return { text: out.join('\n'), orphanMarkers, merged, stray };
+}
+
+/**
+ * 自愈（纯函数）：把损坏的 AGENTS.md 修复为单一标记区（H1 + Task#9 收敛增强）。
+ * 提取全部区内块 → 按 hub-id 去重（顺序按首次出现，内容保留最后出现的版本）→
+ * 清除区外全部孤儿 start/end 标记 → 区外遗留 hub 块保守归并（区内版本优先，只补缺）→
+ * 在首个区位置重建单一区（无成对区但有块时在文末新建）→ 移除其余区；其余区外内容原样保留。
+ * clean 判定：区数 ≤ 1 且孤儿标记 == 0 且无可归并区外块 → 原样返回（changed=false）；
+ * 无法安全归并的区外块只列入 strayBlocks 清单，不动原文、不阻塞 clean（保证幂等收敛）。
+ * @param {string} content AGENTS.md 全文
+ * @returns {{ content: string, changed: boolean, regionCount: number,
+ *   totalBlocks: number, uniqueBlocks: number, duplicateBlocks: number,
+ *   orphanMarkers: number, strayBlocks: { hubId: string, title: string, reason: string }[] }}
+ *   regionCount 为修复前成对区数；totalBlocks 含区外归并块
+ */
+export function repairAgentsContent(content) {
+  const regions = findHubRegions(content);
+
+  // 1. 区内块汇总：Map 保序（key 首次 set 定顺序，重复 set 覆盖 → 保留最后版本）；
+  //    区内残留的孤儿标记（如嵌套 start）一并计数并随重建剔除
+  const blockMap = new Map();
+  let totalBlocks = 0;
+  let orphanMarkers = 0;
+  for (const r of regions) {
+    orphanMarkers += countOccurrences(r.body, HUB_MARK_START) + countOccurrences(r.body, HUB_MARK_END);
+    for (const b of parseRegionBlocks(r.body)) {
+      totalBlocks += 1;
+      blockMap.set(b.hubId, stripMarkerText(b.text));
+    }
+  }
+
+  // 2. 区外文本切段清理：孤儿标记移除 + 区外遗留 hub 块识别
+  const segments = [];
+  let cursor = 0;
+  for (const r of regions) {
+    segments.push(content.slice(cursor, r.start));
+    cursor = r.end;
+  }
+  segments.push(content.slice(cursor));
+  const strayBlocks = [];
+  const mergedStray = [];
+  const cleaned = segments.map((seg) => {
+    const c = cleanOutsideSegment(seg);
+    orphanMarkers += c.orphanMarkers;
+    strayBlocks.push(...c.stray);
+    mergedStray.push(...c.merged);
+    return c.text;
+  });
+
+  // 3. 区外块归并去重：区内版本优先（遗留块视为历史残渣），仅补区内缺失的 hub-id
+  for (const b of mergedStray) {
+    totalBlocks += 1;
+    if (!blockMap.has(b.hubId)) blockMap.set(b.hubId, b.text);
+  }
+
+  // 4. clean 判定（收紧）：区数 ≤ 1 且无孤儿标记 且无可归并区外块 → 原样返回
+  if (regions.length <= 1 && orphanMarkers === 0 && mergedStray.length === 0) {
+    return {
+      content,
+      changed: false,
+      regionCount: regions.length,
+      totalBlocks,
+      uniqueBlocks: blockMap.size,
+      duplicateBlocks: totalBlocks - blockMap.size,
+      orphanMarkers: 0,
+      strayBlocks,
+    };
+  }
+
+  // 5. 重建：单一区落在首区位置（无成对区但有块时在文末新建），其余区整体移除
+  const regionText = `${HUB_MARK_START}\n${[...blockMap.values()].join('\n\n')}\n${HUB_MARK_END}`;
+  let out;
+  if (regions.length === 0) {
+    out = cleaned[0];
+    if (blockMap.size > 0) {
+      const sep = out && !out.endsWith('\n') ? '\n' : '';
+      out = `${out}${sep}${regionText}\n`;
+    }
+  } else {
+    out = cleaned[0] + regionText + cleaned.slice(1).join('');
+  }
+  return {
+    content: out,
+    changed: out !== content,
+    regionCount: regions.length,
+    totalBlocks,
+    uniqueBlocks: blockMap.size,
+    duplicateBlocks: totalBlocks - blockMap.size,
+    orphanMarkers,
+    strayBlocks,
+  };
+}
+
+/**
+ * 自愈（落盘版）：修复单个 AGENTS.md 的多标记区/孤儿标记/区外遗留块问题。
+ * 供 CLI `hub writeback --repair` 接线；走 writeFilesSafely（备份→原子写→校验→失败回滚）。
+ * @param {string} filePath AGENTS.md 绝对路径
+ * @returns {{ path: string, status: 'missing'|'clean'|'repaired', backupDir?: string,
+ *   regionCount?: number, totalBlocks?: number, uniqueBlocks?: number, duplicateBlocks?: number,
+ *   orphanMarkers?: number, strayBlocks?: { hubId: string, title: string, reason: string }[] }}
+ *   orphanMarkers 为本次清除的孤儿标记数；strayBlocks 为无法安全归并、原文保留的区外块清单
+ */
+export function repairFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    return { path: filePath, status: 'missing' };
+  }
+  const preStat = statSafe(filePath);
+  const original = fs.readFileSync(filePath, 'utf8');
+  const r = repairAgentsContent(original);
+  if (!r.changed) {
+    return {
+      path: filePath,
+      status: 'clean',
+      regionCount: r.regionCount,
+      orphanMarkers: 0,
+      strayBlocks: r.strayBlocks,
+    };
+  }
+  // 修复结果可能不再含标记区（如全文只有孤儿标记且无任何块），expectMarker 按结果动态给定
+  const expectMarker = findHubRegions(r.content).length > 0 ? [HUB_MARK_START, HUB_MARK_END] : [];
+  const { backupDir } = writeFilesSafely([
+    {
+      path: filePath,
+      content: r.content,
+      verifyOpts: { expectMarker },
+      app: 'codex',
+      preStat,
+    },
+  ]);
+  return {
+    path: filePath,
+    status: 'repaired',
+    backupDir,
+    regionCount: r.regionCount,
+    totalBlocks: r.totalBlocks,
+    uniqueBlocks: r.uniqueBlocks,
+    duplicateBlocks: r.duplicateBlocks,
+    orphanMarkers: r.orphanMarkers,
+    strayBlocks: r.strayBlocks,
+  };
 }
 
 /**
@@ -153,7 +458,10 @@ export class CodexAdapter extends BaseAdapter {
    * @returns {string} 新全文
    */
   buildMergedContent(original, entries) {
-    const { before, region, after } = splitHubRegion(original);
+    // H1/Task#9 自愈：写路径发现多标记区/孤儿标记/区外遗留块时，先收敛为单一区再做
+    // 常规「整区重写」，历史坏文件随下一次写回自动痊愈
+    const healed = repairAgentsContent(original).content;
+    const { before, region, after } = splitHubRegion(healed);
     // 旧区已有块（按 hub-id 索引）+ 本次条目覆盖/新增
     const blockMap = new Map();
     if (region !== null) {
@@ -169,8 +477,8 @@ export class CodexAdapter extends BaseAdapter {
     if (region === null) {
       // 区不存在 → 文末追加创建（Bug#6 修复：区外内容逐字节原样保留，
       // 不多补空行；仅当原文末尾无换行时补一个换行分隔）
-      const sep = original && !original.endsWith('\n') ? '\n' : '';
-      return `${original}${sep}${regionText}\n`;
+      const sep = healed && !healed.endsWith('\n') ? '\n' : '';
+      return `${healed}${sep}${regionText}\n`;
     }
     return `${before}${regionText}${after}`;
   }
@@ -227,7 +535,58 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   /**
-   * 写回后校验：标记成对存在 + 每个条目的 hub-id 均在区内。
+   * 删除传播：从每个 AGENTS.md 标记区内移除指定 hubId 的条目块（区外内容永不触碰）。
+   * 先自愈多区再整区重写，走 writeFilesSafely（备份→inflight→原子写→校验→失败回滚）；
+   * 无命中块的文件不产生任何写入（幂等，重放安全）。
+   * @param {string[]} hubIds 待移除的 hub-id 列表
+   * @returns {Promise<Object[]>} 逐命中结果 { hubId, status: 'removed'|'deferred', targets, backupDir? }
+   */
+  async removeEntries(hubIds) {
+    const wanted = new Set(hubIds || []);
+    const results = [];
+    if (wanted.size === 0) return results;
+    for (const agentsPath of this.memoryPaths) {
+      if (!fs.existsSync(agentsPath)) continue;
+      const preStat = statSafe(agentsPath); // H2b：读取时 stat 守卫基准
+      const original = fs.readFileSync(agentsPath, 'utf8');
+      const healed = repairAgentsContent(original).content; // H1/Task#9：先收敛为单一区
+      const { before, region, after } = splitHubRegion(healed);
+      if (region === null) continue;
+      const blocks = parseRegionBlocks(region);
+      const hit = blocks.filter((b) => wanted.has(b.hubId));
+      if (hit.length === 0) continue;
+      const keep = blocks.filter((b) => !wanted.has(b.hubId));
+      const regionText = `${HUB_MARK_START}\n${keep.map((b) => b.text).join('\n\n')}\n${HUB_MARK_END}`;
+      const merged = `${before}${regionText}${after}`;
+      try {
+        const { backupDir } = writeFilesSafely([
+          {
+            path: agentsPath,
+            content: merged,
+            verifyOpts: { expectMarker: [HUB_MARK_START, HUB_MARK_END] },
+            app: this.id,
+            preStat,
+          },
+        ]);
+        for (const b of hit) {
+          results.push({ hubId: b.hubId, status: 'removed', targets: [agentsPath], backupDir });
+        }
+      } catch (err) {
+        if (err.deferred) {
+          // 读-写间隙被外部修改 → 本轮放弃，下轮基于新内容重新移除
+          for (const b of hit) {
+            results.push({ hubId: b.hubId, status: 'deferred', targets: [agentsPath], reason: err.message });
+          }
+        } else {
+          throw err;
+        }
+      }
+    }
+    return results;
+  }
+
+  /**
+   * 写回后校验：标记区计数必须为 1（H1）+ 无孤儿标记（Task#9）+ 每个条目的 hub-id 均在区内。
    * @param {Object[]} entries Entry[]
    * @returns {{ ok: boolean, reasons: string[] }}
    */
@@ -239,13 +598,27 @@ export class CodexAdapter extends BaseAdapter {
         continue;
       }
       const content = fs.readFileSync(agentsPath, 'utf8');
-      const { region } = splitHubRegion(content);
-      if (region === null) {
+      const regions = findHubRegions(content);
+      // 孤儿标记断言：与 repairAgentsContent 同一套判定（成对区之外的任何标记即孤儿，
+      // 代码围栏内的用户示例除外），保证 verify 与 repair 的收敛口径一致
+      const heal = repairAgentsContent(content);
+      if (heal.orphanMarkers > 0) {
+        reasons.push(
+          `${agentsPath} 存在 ${heal.orphanMarkers} 个孤儿 memory-hub 标记（需 repairFile 自愈）`,
+        );
+      }
+      if (regions.length === 0) {
         reasons.push(`${agentsPath} 缺少 memory-hub 标记区`);
         continue;
       }
+      if (regions.length !== 1) {
+        reasons.push(
+          `${agentsPath} 存在 ${regions.length} 个 memory-hub 标记区（应为 1，需 repairFile 自愈）`,
+        );
+      }
+      const regionBody = regions.map((r) => r.body).join('\n');
       for (const entry of entries) {
-        if (!region.includes(`[${entry.hubId}]`)) {
+        if (!regionBody.includes(`[${entry.hubId}]`)) {
           reasons.push(`${agentsPath} 标记区内缺少 ${entry.hubId}`);
         }
       }

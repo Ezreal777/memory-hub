@@ -7,7 +7,9 @@
  * 3. 抢锁超时兜底（锁被存活进程长期持有 → 抛明确错误）；
  * 4. 多进程并发不丢更新：N 个子进程各自 withLock 对同一 JSON 做 RMW 自增，
  *    最终计数 = N × M（无锁时必丢更新）；
- * 5. 多进程并发 registerInflight 不丢条目（H1 核心场景：daemon 与 CLI 并发）。
+ * 5. 多进程并发 registerInflight 不丢条目（H1 核心场景：daemon 与 CLI 并发）；
+ * 6. H6 心跳机制：心跳新鲜时锁龄再大也不可破、心跳僵死/pid 已死可破、
+ *    持锁期间心跳续期、异常路径定时器不泄漏、等待期间打印持有者提示。
  *
  * 运行：npm test 或 node test/test-lock.js
  */
@@ -19,7 +21,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { withLock, lockPathFor, isPidAlive } from '../src/util/lock.js';
+import {
+  withLock,
+  lockPathFor,
+  isPidAlive,
+  LOCK_TIMEOUT_MS,
+  LOCK_STALE_MS,
+  LOCK_HEARTBEAT_MS,
+} from '../src/util/lock.js';
 
 const tmpRoots = [];
 
@@ -191,4 +200,127 @@ test('RV-O1：全局写回锁持锁期间实际锁文件恰为 state/write.lock'
     assert.equal(fs.existsSync(`${lockTarget}.lock`), false, 'write.lock.lock 双后缀不得存在');
   });
   assert.equal(fs.existsSync(lockTarget), false, '释放后锁文件应已删除');
+});
+
+// ---------------------------------------------------------------------------
+// H6：锁心跳机制——陈旧判定改为「pid 不存活 或 心跳（mtime）超限」，不再按创建时间判龄
+// ---------------------------------------------------------------------------
+
+test('H6：阈值升级——等待超时 120s、心跳陈旧阈值 3 分钟、心跳间隔 ~20s', () => {
+  assert.equal(LOCK_TIMEOUT_MS, 120 * 1000, '排队方等待超时须大于一次写回的最长持锁时长（90s+）');
+  assert.equal(LOCK_STALE_MS, 3 * 60 * 1000);
+  assert.equal(LOCK_HEARTBEAT_MS, 20 * 1000);
+  assert.ok(LOCK_HEARTBEAT_MS * 3 < LOCK_STALE_MS, '陈旧阈值须留多个心跳周期的冗余');
+});
+
+test('H6 防破锁：持锁 pid 存活且心跳新鲜时，创建时间再久也不可破（只能超时）', () => {
+  const dir = freshDir('mh-lock-h6-keep-');
+  const file = path.join(dir, 'state.json');
+  const lockFile = lockPathFor(file);
+  // 旧实现的击穿场景：ts（创建时间）已过 10 分钟，但持锁进程存活且 mtime（心跳）新鲜——
+  // 旧版按锁龄 60s 判陈旧会删锁闯入；新版必须抢锁超时而非破锁（v:2 心跳协议锁）
+  fs.writeFileSync(lockFile, JSON.stringify({ v: 2, pid: process.pid, ts: Date.now() - 10 * 60 * 1000 }));
+  assert.throws(
+    () => withLock(file, () => 'never', { timeoutMs: 300 }),
+    /抢锁超时/,
+    '心跳新鲜的活锁绝不可被破除',
+  );
+  assert.equal(fs.existsSync(lockFile), true, '锁文件应完好无损（未被误删）');
+  fs.rmSync(lockFile, { force: true });
+});
+
+test('H6 可破锁：持锁 pid 存活但心跳（mtime）超过 3 分钟 → 判僵死可破', () => {
+  const dir = freshDir('mh-lock-h6-dead-hb-');
+  const file = path.join(dir, 'state.json');
+  const lockFile = lockPathFor(file);
+  fs.writeFileSync(lockFile, JSON.stringify({ v: 2, pid: process.pid, ts: Date.now() }));
+  // 把心跳（mtime）回拨到 4 分钟前：模拟持锁进程僵死/pid 被复用（复用者不会续期）
+  const old = new Date(Date.now() - 4 * 60 * 1000);
+  fs.utimesSync(lockFile, old, old);
+  const r = withLock(file, () => 'reclaimed', { timeoutMs: 500 });
+  assert.equal(r, 'reclaimed', '心跳僵死的锁应可被破除重抢');
+  assert.equal(fs.existsSync(lockFile), false);
+});
+
+test('H6 可破锁：持锁 pid 已死 → 心跳再新鲜也立即可破', () => {
+  const dir = freshDir('mh-lock-h6-dead-pid-');
+  const file = path.join(dir, 'state.json');
+  const lockFile = lockPathFor(file);
+  // mtime 新鲜（刚写入）但 pid 必死 → 不等心跳超限，立即判陈旧
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: deadPid(), ts: Date.now() }));
+  const r = withLock(file, () => 'ok', { timeoutMs: 500 });
+  assert.equal(r, 'ok');
+  assert.equal(fs.existsSync(lockFile), false);
+});
+
+test('H6 心跳续期：async 长临界区内锁文件 mtime 被周期 touch 刷新', async () => {
+  const dir = freshDir('mh-lock-h6-hb-');
+  const file = path.join(dir, 'state.json');
+  const lockFile = lockPathFor(file);
+  let mtimeAtStart = 0;
+  let mtimeNearEnd = 0;
+  await withLock(
+    file,
+    async () => {
+      mtimeAtStart = fs.statSync(lockFile).mtimeMs;
+      // 把 mtime 人为回拨 10 分钟：若心跳真在跳，会把它 touch 回当前时间
+      const old = new Date(Date.now() - 10 * 60 * 1000);
+      fs.utimesSync(lockFile, old, old);
+      await new Promise((r) => setTimeout(r, 200)); // 跨越至少 4 个心跳周期（40ms）
+      mtimeNearEnd = fs.statSync(lockFile).mtimeMs;
+      return 'held';
+    },
+    { heartbeatMs: 40 },
+  );
+  assert.ok(mtimeAtStart > 0);
+  assert.ok(
+    Date.now() - mtimeNearEnd < 5 * 60 * 1000,
+    `心跳应把回拨 10 分钟的 mtime 重新 touch 至近期（实测距今 ${Date.now() - mtimeNearEnd}ms）`,
+  );
+  assert.equal(fs.existsSync(lockFile), false, '释放后锁文件应已删除');
+});
+
+test('H6 定时器清理：fn 抛错/正常返回后心跳停止，锁不会被“幽灵心跳”复活', async () => {
+  const dir = freshDir('mh-lock-h6-cleanup-');
+  const file = path.join(dir, 'state.json');
+  const lockFile = lockPathFor(file);
+
+  // 异常路径：抛错后锁已释放，等足多个心跳周期，锁文件不得被残留定时器重建/重 touch
+  assert.throws(
+    () => withLock(file, () => {
+      throw new Error('boom');
+    }, { heartbeatMs: 30 }),
+    /boom/,
+  );
+  assert.equal(fs.existsSync(lockFile), false);
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(fs.existsSync(lockFile), false, '心跳定时器应已清理，不得复活锁文件');
+
+  // async 正常路径同理
+  await withLock(file, async () => 'ok', { heartbeatMs: 30 });
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(fs.existsSync(lockFile), false);
+});
+
+test('H6 等待提示：抢锁等待期间周期打印「等待锁中，持有者 pid=X」', () => {
+  const dir = freshDir('mh-lock-h6-waitlog-');
+  const file = path.join(dir, 'state.json');
+  const lockFile = lockPathFor(file);
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+
+  const logs = [];
+  const origError = console.error;
+  console.error = (...args) => logs.push(args.join(' '));
+  try {
+    assert.throws(
+      () => withLock(file, () => 'never', { timeoutMs: 250, waitLogMs: 60 }),
+      /抢锁超时/,
+    );
+  } finally {
+    console.error = origError;
+    fs.rmSync(lockFile, { force: true });
+  }
+  const waitLogs = logs.filter((l) => l.includes('等待锁中'));
+  assert.ok(waitLogs.length >= 1, `等待期间应至少打印一条提示（实得 ${logs.length} 条日志）`);
+  assert.ok(waitLogs[0].includes(`pid=${process.pid}`), '提示应含持有者 pid');
 });

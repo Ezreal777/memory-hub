@@ -49,9 +49,24 @@ function onlyDirs(hits) {
 }
 
 /**
+ * 安全取目录/文件 mtime（毫秒），失败返回 0。
+ * @param {string} p 路径
+ * @returns {number}
+ */
+function mtimeSafe(p) {
+  try {
+    return fs.statSync(p).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * claude：探测 ~/.claude/projects/<项目>/memory/MEMORY.md。
  * 命中后取 MEMORY.md 所在目录（即 .../memory）作为 memory_paths，
  * 所在项目 slug（projects 下一级目录名）记入 notes。
+ * L5：多项目时 glob 顺序不稳定——按项目目录 mtime 最新者优先选 slug（同 mtime 按名字典序），
+ * 两次 scan 之间 slug 不再跳变；全部候选 slug 列入 notes。
  * @param {string} home 家目录
  * @returns {Object} 探测结果
  */
@@ -60,14 +75,18 @@ function probeClaude(home) {
   if (hits.length === 0) {
     return { found: false, memory_paths: [], project_slug: '', notes: '未找到' };
   }
-  const memoryPaths = hits.map((h) => path.dirname(h)); // MEMORY.md 所在目录
-  // 项目 slug = projects 的下一级目录名（MEMORY.md 往上第 2 层）
-  const slugs = hits.map((h) => path.basename(path.dirname(path.dirname(h))));
+  // 项目 slug = projects 的下一级目录名（MEMORY.md 往上第 2 层）；按项目目录 mtime 降序排序
+  const ranked = hits
+    .map((h) => {
+      const projDir = path.dirname(path.dirname(h));
+      return { hit: h, slug: path.basename(projDir), mtimeMs: mtimeSafe(projDir) };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || a.slug.localeCompare(b.slug));
   return {
     found: true,
-    memory_paths: memoryPaths,
-    project_slug: slugs[0] || '',
-    notes: `projects: ${slugs.join(', ')}`,
+    memory_paths: ranked.map((r) => path.dirname(r.hit)), // MEMORY.md 所在目录
+    project_slug: ranked[0].slug,
+    notes: `projects: ${ranked.map((r) => r.slug).join(', ')}`,
   };
 }
 
@@ -106,8 +125,10 @@ function probeCodex(home, existing) {
 /**
  * qoder：枚举 ~/.qoder/memories/<账号>/projects/<slug>/。
  * 账号目录与项目 slug 全部动态枚举发现；
- * memory 根目录（账号目录）记入 memory_paths，首个 slug 记入 project_slug，
- * 全部 slug 清单记入 notes。
+ * memory 根目录（账号目录）记入 memory_paths，
+ * L5：多 slug 时按项目目录 mtime 最新者选 project_slug（同 mtime 按名字典序，
+ * 不再取 glob 首位——其顺序不稳定，两次 scan 间 slug 可能跳变），
+ * 全部候选 slug 清单记入 notes。
  * @param {string} home 家目录
  * @returns {Object} 探测结果
  */
@@ -118,9 +139,13 @@ function probeQoder(home) {
   if (projDirs.length === 0) {
     return { found: false, memory_paths: [], project_slug: '', notes: '未找到' };
   }
+  // 按项目目录 mtime 降序排序，最新者优先
+  const ranked = projDirs
+    .map((d) => ({ dir: d, slug: path.basename(d), mtimeMs: mtimeSafe(d) }))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs || a.slug.localeCompare(b.slug));
   // memory 根目录 = projects 的上一级（账号目录），去重
-  const roots = [...new Set(projDirs.map((d) => path.dirname(path.dirname(d))))];
-  const slugs = projDirs.map((d) => path.basename(d));
+  const roots = [...new Set(ranked.map((r) => path.dirname(path.dirname(r.dir))))];
+  const slugs = ranked.map((r) => r.slug);
   return {
     found: true,
     memory_paths: roots,
@@ -194,18 +219,29 @@ export function scanApps(opts = {}) {
 
     // L7：写回 notes 时保留既有 readOnly 标注（否则重扫会把只读标记冲掉）
     let notes = result.found ? result.notes : '未找到';
+
+    // L4：区分「上次未找到被自动禁用」与「用户手动禁用」——
+    // 既有 notes 带 scan 自动禁用足迹（未找到/探测异常/未知 app）才允许重新启用；
+    // 否则 enabled===false 视为用户手动禁用，重扫保持禁用（与 readOnly 保留逻辑同风格）
+    const autoDisabled = /未找到|探测异常|未知 app/.test(String(app.notes || ''));
+    const keepDisabled = result.found && app.enabled === false && !autoDisabled;
+    const enabled = keepDisabled ? false : result.found;
+    if (keepDisabled) {
+      notes = `${notes} | 检测到但保持禁用`;
+    }
+
     if (/read[-_ ]?only/i.test(String(app.notes || '')) && !/read[-_ ]?only/i.test(notes)) {
       notes = `${notes} | readOnly`;
     }
 
     updateApp(app.id, {
-      enabled: result.found, // 未找到 → 禁用；找到 → 重新启用
+      enabled, // 未找到 → 禁用；找到 → 启用（用户手动禁用的保持禁用）
       memory_paths: result.memory_paths,
       project_slug: result.project_slug,
       notes,
     });
 
-    rows.push({ id: app.id, ...result });
+    rows.push({ id: app.id, ...result, enabled, notes });
   }
   return rows;
 }
@@ -220,7 +256,9 @@ export function formatScanSummary(rows) {
   lines.push('App        状态        路径');
   lines.push('-'.repeat(72));
   for (const row of rows) {
-    const status = row.found ? '✅ 已发现' : '❌ 未找到';
+    const status = row.found
+      ? (row.enabled === false ? '⚠️ 保持禁用' : '✅ 已发现')
+      : '❌ 未找到';
     const pathsText = row.memory_paths.length > 0 ? row.memory_paths.join(' ; ') : '-';
     lines.push(`${row.id.padEnd(10)} ${status.padEnd(10)} ${pathsText}`);
   }

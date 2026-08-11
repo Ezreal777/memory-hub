@@ -241,6 +241,19 @@ export class BaseAdapter {
 }
 
 /**
+ * 通用工具：安全读文件文本，失败（文件瞬时被改名/删除等）返回空串。
+ * @param {string} filePath 文件绝对路径
+ * @returns {string}
+ */
+export function readFileSafe(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 通用工具：安全列出目录下的直接文件（不递归），自动剔除忽略项。
  * @param {string} dir 目录绝对路径
  * @param {(name: string) => boolean} [filter] 额外文件名过滤器

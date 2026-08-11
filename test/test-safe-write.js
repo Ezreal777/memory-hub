@@ -129,8 +129,8 @@ test('atomicAppend 不丢失原有内容', async () => {
   assert.equal(fs.readFileSync(backupPath, 'utf8'), base, '备份内容应为追加前状态');
 });
 
-test('备份保留策略：造 21 份备份后仅保留最近 20 份', async () => {
-  const { backup, listBackupDirs, MAX_BACKUPS } = await import('../src/safe-write.js');
+test('备份保留策略：新鲜备份受保护窗口保护，做旧后按限额保留 20 份', async () => {
+  const { backup, listBackupDirs, pruneBackups, MAX_BACKUPS } = await import('../src/safe-write.js');
   freshHubRoot(); // 隔离，避免其他用例的备份干扰计数
 
   const src = makeWorkFile('retention-src.md', 'v0');
@@ -141,8 +141,15 @@ test('备份保留策略：造 21 份备份后仅保留最近 20 份', async () 
     dirs.push(path.dirname(bp));
   }
 
-  const remaining = listBackupDirs();
+  // N3：保护窗口内的新鲜备份不淘汰（防同轮写回的回滚依据被提前清理）
   assert.equal(MAX_BACKUPS, 20);
+  assert.equal(listBackupDirs().length, 21, '新鲜备份全部受保护，暂不淘汰');
+
+  // 把 mtime 做旧到窗口外 → 按限额淘汰只留 20 份
+  const staleTime = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  for (const d of dirs) fs.utimesSync(d, staleTime, staleTime);
+  pruneBackups();
+  const remaining = listBackupDirs();
   assert.equal(remaining.length, 20, '应只保留 20 份备份目录');
   assert.ok(!fs.existsSync(dirs[0]), '最早的一份备份应被清理');
   assert.ok(fs.existsSync(dirs[20]), '最新的一份备份应保留');

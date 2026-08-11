@@ -1,19 +1,23 @@
 /**
  * hub-store.js —— Karpathy 三层中转站存储与摄取。
  *
- * 目录结构（一律位于 ~/.memory-hub/hub/ 下）：
+ * 目录结构（用户可视内容位于 paths.hub，缺省 ~/Desktop/Memory Hub/）：
  *   sources/<app>/<YYYYMMDD-HHmmss>-<slug>.md   原始快照层（不可变、只增），
  *                                                文件头带来源元数据块（app/源路径/摄取时间/sha256）
  *   wiki/                                        整理层占位（本任务仅建目录 + README，distill 任务写入）
  *   _index/master-index.md                       目录索引（generateMasterIndex 扫 wiki/ 生成）
- *   state/hash-state.json                        SHA-256 + mtimeMs 逐文件对账状态（借鉴 QoderWork 模式）
+ *
+ * 内部状态（不可视，位于底层 ~/.memory-hub/state/，避免桌面误删后重复摄取）：
+ *   state/hash-state.json                        SHA-256 + mtimeMs + size 逐文件对账状态（借鉴 QoderWork 模式）
  *
  * 所有写磁盘一律走 safe-write 的原子写；五个 App 目录只读，本模块绝不写回。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, ensureDir, FILE_MODE } from './util/paths.js';
+import { randomInt } from 'node:crypto';
+import matter from 'gray-matter';
+import { paths, ensureDir, hubRoot, FILE_MODE } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
 import { slugify, sha256Of } from './adapters/base.js';
 import { consumeInflight } from './inflight.js';
@@ -24,33 +28,37 @@ import { withLock } from './util/lock.js';
  * 中转站内部各层路径（惰性 getter，随 MEMORY_HUB_ROOT 切换即时生效）。
  */
 export const storePaths = {
-  /** 中转站根 ~/.memory-hub/hub */
+  /** 中转站用户可视根 ~/Desktop/Memory Hub */
   get root() {
     return paths.hub;
   },
-  /** 原始快照层 ~/.memory-hub/hub/sources */
+  /** 原始快照层 ~/Desktop/Memory Hub/sources */
   get sources() {
     return path.join(paths.hub, 'sources');
   },
-  /** 整理层 ~/.memory-hub/hub/wiki */
+  /** 整理层 ~/Desktop/Memory Hub/wiki */
   get wiki() {
     return path.join(paths.hub, 'wiki');
   },
-  /** 索引目录 ~/.memory-hub/hub/_index */
+  /** 索引目录 ~/Desktop/Memory Hub/_index */
   get index() {
     return path.join(paths.hub, '_index');
   },
-  /** 主索引文件 ~/.memory-hub/hub/_index/master-index.md */
+  /** 主索引文件 ~/Desktop/Memory Hub/_index/master-index.md */
   get masterIndex() {
     return path.join(paths.hub, '_index', 'master-index.md');
   },
-  /** 状态目录 ~/.memory-hub/hub/state */
+  /** 内部状态目录（底层，不随用户可视目录迁移） ~/.memory-hub/state */
   get state() {
-    return path.join(paths.hub, 'state');
+    return paths.state;
   },
-  /** 对账状态文件 ~/.memory-hub/hub/state/hash-state.json */
+  /** 对账状态文件 ~/.memory-hub/state/hash-state.json */
   get hashState() {
-    return path.join(paths.hub, 'state', 'hash-state.json');
+    return path.join(paths.state, 'hash-state.json');
+  },
+  /** 删除传播清单 ~/.memory-hub/state/tombstones.json */
+  get tombstones() {
+    return path.join(paths.state, 'tombstones.json');
   },
 };
 
@@ -64,9 +72,107 @@ const WIKI_README = [
 ].join('\n');
 
 /**
+ * 递归合并搬移：把 from 下的条目逐个挪到 to。
+ * - 目标不存在 → 直接 rename；
+ * - 目标已存在且两边都是目录 → 继续下钻合并；
+ * - 目标已存在且两边都是文件：内容一致则删源去重，不一致则源留原地供人工处理。
+ * 幂等可重入，能从任意中断/部分迁移状态恢复。
+ * @param {string} from 源目录
+ * @param {string} to 目标目录
+ */
+function mergeMoveDir(from, to) {
+  let entries;
+  try {
+    entries = fs.readdirSync(from, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  ensureDir(to);
+  for (const e of entries) {
+    const src = path.join(from, e.name);
+    const dst = path.join(to, e.name);
+    if (!fs.existsSync(dst)) {
+      try {
+        fs.renameSync(src, dst);
+        continue;
+      } catch {
+        // 跨卷等罕见失败：留在原地，下轮重试
+        continue;
+      }
+    }
+    try {
+      const dstStat = fs.statSync(dst);
+      if (e.isDirectory() && dstStat.isDirectory()) {
+        mergeMoveDir(src, dst);
+      } else if (e.isFile() && dstStat.isFile() && fs.readFileSync(src).equals(fs.readFileSync(dst))) {
+        fs.rmSync(src); // 内容完全一致，删源去重
+      }
+      // 内容不一致的同名文件：保留双方，源供人工处理
+    } catch {
+      // 单条失败不阻断其余迁移
+    }
+  }
+  try {
+    fs.rmdirSync(from);
+  } catch {
+    // 非空则保留
+  }
+}
+
+/**
+ * 旧版目录布局一次性迁移（幂等）：旧版内容全部位于 ~/.memory-hub/hub/，
+ * 现迁为“用户可视内容在桌面 + 内部状态在底层 state/”：
+ *   1. 旧 hub/state/* → ~/.memory-hub/state/（目标已存在的文件不覆盖）；
+ *   2. 旧 hub/{sources,wiki,_index} → 桌面新位置（递归合并，可从部分迁移状态恢复）；
+ *   3. 旧目录清空后移除，有残留则保留供人工处理。
+ * 隔离场景（MEMORY_HUB_ROOT 下新旧路径重合）直接跳过。
+ */
+function migrateLegacyHubDir() {
+  const legacy = path.join(hubRoot(), 'hub');
+  const target = storePaths.root;
+  if (legacy === target || !fs.existsSync(legacy)) return;
+
+  const legacyState = path.join(legacy, 'state');
+  if (fs.existsSync(legacyState)) {
+    ensureDir(paths.state);
+    for (const name of fs.readdirSync(legacyState)) {
+      const from = path.join(legacyState, name);
+      const to = path.join(paths.state, name);
+      if (!fs.existsSync(to)) {
+        try {
+          fs.renameSync(from, to);
+        } catch {
+          // 迁移失败不阻断主流程，下轮重试
+        }
+      }
+    }
+    try {
+      fs.rmdirSync(legacyState);
+    } catch {
+      // 非空则保留
+    }
+  }
+
+  ensureDir(target);
+  for (const name of ['sources', 'wiki', '_index']) {
+    const from = path.join(legacy, name);
+    if (fs.existsSync(from)) {
+      mergeMoveDir(from, path.join(target, name));
+    }
+  }
+  try {
+    fs.rmdirSync(legacy);
+  } catch {
+    // 非空说明有未迁移残留，保留供人工处理
+  }
+}
+
+/**
  * 惰性创建中转站全部子目录，并写入 wiki/README 占位（幂等）。
+ * 先执行旧版布局迁移，再建目录，避免新建空目录挡住迁移。
  */
 export function ensureHubStore() {
+  migrateLegacyHubDir();
   ensureDir(storePaths.root);
   ensureDir(storePaths.sources);
   ensureDir(storePaths.wiki);
@@ -80,6 +186,8 @@ export function ensureHubStore() {
 
 /**
  * 生成 hubId：hub-<YYYYMMDDHHmmss>-<6位随机字母数字>。
+ * L2：随机段改用 node:crypto 的强随机（randomInt 无偏差采样）——
+ * hubId 是跨文件去重与写回幂等的主键，Math.random 存在理论碰撞面；格式不变。
  * @returns {string} hubId
  */
 export function genHubId() {
@@ -91,7 +199,7 @@ export function genHubId() {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let rand = '';
   for (let i = 0; i < 6; i += 1) {
-    rand += alphabet[Math.floor(Math.random() * alphabet.length)];
+    rand += alphabet[randomInt(alphabet.length)];
   }
   return `hub-${ts}-${rand}`;
 }
@@ -139,18 +247,21 @@ export function saveHashState(state) {
 }
 
 /**
- * 记录单个文件的对账指纹（sha256 + mtimeMs + 所属 app + 摄取时间）。
+ * 记录单个文件的对账指纹（sha256 + mtimeMs + size + 所属 app + 摄取时间）。
+ * L3：size 在函数内 stat 获取（保持签名不变），供 getChangedFiles 做 mtime+size 双字段快筛。
  * @param {string} filePath 源文件绝对路径
  * @param {string} sha256 内容摘要
  * @param {number} mtimeMs mtime（毫秒）
  * @param {string} [app] 所属 app id
  */
 export function recordFile(filePath, sha256, mtimeMs, app) {
+  const size = readFileStatSafe(filePath)?.size;
   withLock(storePaths.hashState, () => {
     const state = loadHashState();
     state.files[filePath] = {
       sha256,
       mtimeMs,
+      ...(Number.isFinite(size) ? { size } : {}),
       app: app || state.files[filePath]?.app,
       lastSeen: new Date().toISOString(),
     };
@@ -175,7 +286,7 @@ export function removeFileState(filePath) {
 /**
  * 对比某适配器的当前候选文件与对账状态，得出增/改/删清单。
  * - added：新发现（状态里没有）；
- * - modified：状态里有但 sha256 变化；
+ * - modified：状态里有但 sha256 变化（快筛为 mtime+size 双字段，任一变化才进 sha 精判）；
  * - removed：状态里属于该 app、但已不在候选清单中。
  * @param {Object} adapter 适配器实例（需提供 discover() 与 id）
  * @returns {{ added: string[], modified: string[], removed: string[] }}
@@ -187,20 +298,26 @@ export function getChangedFiles(adapter) {
 
   const added = [];
   const modified = [];
+  // L3：旧版 hash-state 无 size 字段的记录，sha 重算一致后回填 size（只重算一次，后续走快筛）
+  const backfill = [];
   for (const p of discovered) {
     const rec = state.files[p];
     if (!rec) {
       added.push(p);
       continue;
     }
-    // mtime 未变则跳过 sha 判断（快筛）；变了再比 sha 精判
+    // 快筛（L3 增强）：mtime + size 双字段均未变才跳过 sha 精判——
+    // 仅比 mtime 会漏掉保留 mtime 的写入（rsync/备份还原等）；任一变化即进 sha 比对
     const meta = readFileStatSafe(p);
-    if (meta && meta.mtimeMs === rec.mtimeMs && rec.sha256) {
-      continue; // mtime 相同视为未变
+    const sizeKnown = Number.isFinite(rec.size);
+    if (meta && rec.sha256 && meta.mtimeMs === rec.mtimeMs && sizeKnown && meta.size === rec.size) {
+      continue; // mtime + size 均相同视为未变
     }
     const sha = meta ? sha256Of(fs.readFileSync(p)) : null;
     if (sha !== null && sha !== rec.sha256) {
       modified.push(p);
+    } else if (sha !== null && !sizeKnown) {
+      backfill.push({ p, size: meta.size }); // 旧 state 兼容：内容未变，补记 size
     }
   }
 
@@ -209,6 +326,17 @@ export function getChangedFiles(adapter) {
     if (rec.app === adapter.id && !discoveredSet.has(p)) {
       removed.push(p);
     }
+  }
+
+  // 批量回填 size（一次锁内完成）；只补字段不改 sha/mtime，对既有语义无影响
+  if (backfill.length > 0) {
+    withLock(storePaths.hashState, () => {
+      const st = loadHashState();
+      for (const { p, size } of backfill) {
+        if (st.files[p]) st.files[p].size = size;
+      }
+      saveHashState(st);
+    });
   }
   return { added, modified, removed };
 }
@@ -253,6 +381,11 @@ export function ingest(adapter, entry, opts = {}) {
     n += 1;
   }
   atomicWrite(target, content, { mode: FILE_MODE });
+
+  // 删除传播：同源路径重新出现内容 = 用户重建了记忆 → 解除该源文件的 tombstone
+  if (fs.existsSync(tombstonesPath())) {
+    liftTombstonesForSource(entry.file);
+  }
 
   if (opts.recordState !== false) {
     recordFile(entry.file, entry.sha256, entry.mtime, appId);
@@ -304,13 +437,15 @@ function yamlScalar(v) {
  * 流程：getChangedFiles → 逐个 read + parse → 逐条 ingest → 文件级 recordFile →
  * removed 文件清理状态。
  * @param {Object} adapter 适配器实例
- * @returns {{ ingested: number, files: number, removed: number }}
+ * @returns {{ ingested: number, files: number, removed: number, bytes: number }}
+ *   bytes 为本轮摄取正文体积估算（供 daemon 事件阈值计量）
  */
 export function harvest(adapter) {
   ensureHubStore();
   const { added, modified, removed } = getChangedFiles(adapter);
   const targets = [...added, ...modified];
   let ingested = 0;
+  let bytes = 0;
   for (const filePath of targets) {
     const raw = adapter.read(filePath);
     if (!raw) continue;
@@ -329,6 +464,7 @@ export function harvest(adapter) {
     for (const entry of entries) {
       ingest(adapter, entry, { recordState: false });
       ingested += 1;
+      bytes += String(entry.body || '').length;
     }
     // 无论是否产出条目，都在文件级记录一次指纹（0 条目的跳过文件也记，避免反复重判）
     recordFile(filePath, raw.sha256, raw.mtimeMs, adapter.id);
@@ -336,7 +472,7 @@ export function harvest(adapter) {
   for (const p of removed) {
     removeFileState(p);
   }
-  return { ingested, files: targets.length, removed: removed.length };
+  return { ingested, files: targets.length, removed: removed.length, bytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -420,4 +556,246 @@ export function generateMasterIndex() {
   }
   atomicWrite(storePaths.masterIndex, lines.join('\n'), { mode: FILE_MODE });
   return storePaths.masterIndex;
+}
+
+// ---------------------------------------------------------------------------
+// 删除传播（tombstone）：源文件被删 → 登记 hubId → distill/writeback 消费
+// ---------------------------------------------------------------------------
+
+/** tombstone 清单文件路径 ~/.memory-hub/state/tombstones.json */
+export function tombstonesPath() {
+  return storePaths.tombstones;
+}
+
+/**
+ * 读取 tombstone 清单；不存在或损坏时返回空结构。
+ * 数据结构：{ version, tombstones: { "<hubId>": { app, source, deletedAt,
+ *   wikiApplied?, appsCleaned?, suspectedStorm? } }, storms: { "<app>": { windowStart,
+ *   count, tripped, windowIds } } }：
+ * - deletedAt：watcher 确认源文件删除的时间；
+ * - wikiApplied：distill 已完成 wiki 侧标记（条目块移除/页级 deleted）的时间；
+ * - appsCleaned：writeback 已完成全部启用 App 侧条目移除的时间；
+ * - suspectedStorm：风暴熔断标记（MUST-2），自动传播跳过此类条目，需人工确认；
+ * - storms：每个适配器的熔断窗口状态（仅 addTombstonesGuarded 维护）。
+ * @returns {{ version: number, tombstones: Object.<string, Object>, storms: Object.<string, Object> }}
+ */
+export function loadTombstones() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(tombstonesPath(), 'utf8'));
+    if (raw && typeof raw === 'object' && raw.tombstones && typeof raw.tombstones === 'object') {
+      return {
+        version: raw.version || 1,
+        tombstones: raw.tombstones,
+        storms: raw.storms && typeof raw.storms === 'object' ? raw.storms : {},
+      };
+    }
+  } catch {
+    // 首次运行或损坏：空清单
+  }
+  return { version: 1, tombstones: {}, storms: {} };
+}
+
+/** 保存 tombstone 清单（原子写，600 权限；调用方需自行持锁） */
+function saveTombstones(state) {
+  ensureDir(storePaths.state);
+  atomicWrite(tombstonesPath(), `${JSON.stringify(state, null, 2)}\n`, { mode: FILE_MODE });
+}
+
+/**
+ * 登记一组 tombstone（withLock + 原子写）。已存在的 hubId 不覆盖（首次删除时间为准）。
+ * @param {{ hubId: string, app?: string, source?: string }[]} items
+ * @returns {string[]} 本次新登记的 hubId
+ */
+export function addTombstones(items) {
+  const added = [];
+  withLock(tombstonesPath(), () => {
+    const state = loadTombstones();
+    const now = new Date().toISOString();
+    for (const it of items || []) {
+      if (!it || !it.hubId || state.tombstones[it.hubId]) continue;
+      state.tombstones[it.hubId] = {
+        app: it.app || '',
+        source: it.source || '',
+        deletedAt: now,
+      };
+      added.push(it.hubId);
+    }
+    if (added.length > 0) saveTombstones(state);
+  });
+  return added;
+}
+
+/** 风暴熔断缺省阈值（与 config.tombstone.stormThreshold 默认值一致） */
+export const DEFAULT_STORM_THRESHOLD = 20;
+
+/** 风暴熔断缺省窗口时长（10 分钟，与 config.tombstone.stormWindowMs 默认值一致） */
+export const DEFAULT_STORM_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * 带风暴熔断的 tombstone 登记（MUST-2，watcher unlink 路径专用）。
+ * 单个适配器在一个熔断窗口（stormWindowMs）内新登记数超过 stormThreshold 时熔断：
+ * - 本窗口内已登记的条目打上 suspectedStorm: true（自动传播跳过，需人工确认）；
+ * - 窗口内后续登记请求一律拒绝（suppressed，调用方只记日志）；
+ * - 窗口过期后自动复位重新计数。
+ * 已存在的 hubId 不覆盖也不计入风暴计数。
+ * @param {{ hubId: string, app?: string, source?: string }[]} items
+ * @param {{ stormThreshold?: number, stormWindowMs?: number, now?: number }} [opts]
+ * @returns {{ added: string[], suppressed: string[], tripped: string[] }}
+ *   added 本次新登记；suppressed 被熔断拒绝；tripped 本次新触发熔断的 app 列表
+ */
+export function addTombstonesGuarded(items, opts = {}) {
+  const threshold = Number.isFinite(opts.stormThreshold) ? opts.stormThreshold : DEFAULT_STORM_THRESHOLD;
+  const windowMs = Number.isFinite(opts.stormWindowMs) ? opts.stormWindowMs : DEFAULT_STORM_WINDOW_MS;
+  const added = [];
+  const suppressed = [];
+  const tripped = [];
+  withLock(tombstonesPath(), () => {
+    const state = loadTombstones();
+    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+    const nowIso = new Date(now).toISOString();
+    let changed = false;
+    for (const it of items || []) {
+      if (!it || !it.hubId) continue;
+      const app = it.app || '';
+      // 窗口状态：不存在或已过期则复位
+      let storm = state.storms[app];
+      if (!storm || now - Date.parse(storm.windowStart) > windowMs) {
+        storm = { windowStart: nowIso, count: 0, tripped: false, windowIds: [] };
+        state.storms[app] = storm;
+        changed = true;
+      }
+      // 已熔断：本窗口后续 unlink 只记日志不登记（调用方负责打日志）
+      if (storm.tripped) {
+        suppressed.push(it.hubId);
+        continue;
+      }
+      if (state.tombstones[it.hubId]) continue; // 已存在：不覆盖首删时间，不计风暴
+      state.tombstones[it.hubId] = { app, source: it.source || '', deletedAt: nowIso };
+      storm.count += 1;
+      storm.windowIds.push(it.hubId);
+      added.push(it.hubId);
+      changed = true;
+      // 超阈值：熔断——窗口内已登记的全部打 suspectedStorm 标记
+      if (storm.count > threshold) {
+        storm.tripped = true;
+        tripped.push(app);
+        for (const id of storm.windowIds) {
+          if (state.tombstones[id]) state.tombstones[id].suspectedStorm = true;
+        }
+      }
+    }
+    if (changed) saveTombstones(state);
+  });
+  return { added, suppressed, tripped };
+}
+
+/**
+ * 移除（解除）一组 tombstone。
+ * @param {string[]} hubIds
+ * @returns {string[]} 实际被移除的 hubId
+ */
+export function removeTombstones(hubIds) {
+  const removed = [];
+  withLock(tombstonesPath(), () => {
+    const state = loadTombstones();
+    for (const id of hubIds || []) {
+      if (Object.prototype.hasOwnProperty.call(state.tombstones, id)) {
+        delete state.tombstones[id];
+        removed.push(id);
+      }
+    }
+    if (removed.length > 0) saveTombstones(state);
+  });
+  return removed;
+}
+
+/**
+ * 合并更新一组 tombstone 的字段（如 wikiApplied / appsCleaned 打点）。
+ * @param {string[]} hubIds
+ * @param {Object} patch 需合并的字段
+ */
+export function updateTombstones(hubIds, patch) {
+  withLock(tombstonesPath(), () => {
+    const state = loadTombstones();
+    let changed = false;
+    for (const id of hubIds || []) {
+      if (state.tombstones[id]) {
+        state.tombstones[id] = { ...state.tombstones[id], ...patch };
+        changed = true;
+      }
+    }
+    if (changed) saveTombstones(state);
+  });
+}
+
+/**
+ * 扫描 sources/<app>/*.md 快照层（一层，跳过 _quarantine 等隐藏/下划线目录），
+ * 返回每个快照的关键元数据（frontmatter 解析失败的单文件跳过）。
+ * @returns {{ file: string, hubId: string, app: string, source: string, ingestedAt: string }[]}
+ */
+export function listSnapshotMeta() {
+  const out = [];
+  let apps;
+  try {
+    apps = fs.readdirSync(storePaths.sources, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const a of apps) {
+    if (!a.isDirectory() || a.name.startsWith('_') || a.name.startsWith('.')) continue;
+    const dir = path.join(storePaths.sources, a.name);
+    let files;
+    try {
+      files = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.isFile() || !f.name.endsWith('.md')) continue;
+      const file = path.join(dir, f.name);
+      try {
+        const parsed = matter(fs.readFileSync(file, 'utf8'));
+        const hubId = parsed.data?.hubId;
+        if (!hubId) continue;
+        out.push({
+          file,
+          hubId: String(hubId),
+          app: String(parsed.data?.app || a.name),
+          source: String(parsed.data?.source || ''),
+          ingestedAt: String(parsed.data?.ingestedAt || ''),
+        });
+      } catch {
+        // 单文件 frontmatter 损坏：跳过（隔离由 distill 侧 H5 机制负责）
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 按源文件绝对路径反查全部快照 hubId（供 watcher unlink 时定位被删记忆）。
+ * @param {string} sourceFile 源文件路径
+ * @returns {string[]} 对应快照的 hubId 列表（去重）
+ */
+export function findSnapshotHubIdsBySource(sourceFile) {
+  const resolved = path.resolve(sourceFile);
+  const ids = new Set();
+  for (const meta of listSnapshotMeta()) {
+    if (meta.source && path.resolve(meta.source) === resolved) ids.add(meta.hubId);
+  }
+  return [...ids];
+}
+
+/**
+ * 解除指向某源文件的全部 tombstone（同源路径重新摄取 = 用户重建了记忆）。
+ * @param {string} sourceFile 源文件路径
+ * @returns {string[]} 被解除的 hubId
+ */
+export function liftTombstonesForSource(sourceFile) {
+  const resolved = path.resolve(sourceFile);
+  const { tombstones } = loadTombstones();
+  const ids = Object.entries(tombstones)
+    .filter(([, t]) => t.source && path.resolve(t.source) === resolved)
+    .map(([id]) => id);
+  return ids.length > 0 ? removeTombstones(ids) : [];
 }
