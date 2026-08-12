@@ -27,6 +27,7 @@ import { loadConfig, defaultConfig } from './config.js';
 import { Watcher } from './watcher.js';
 import { distill } from './distill.js';
 import { runWriteback, wikiToEntries } from './writeback.js';
+import { compact, compactDue } from './compact.js';
 import { appendLogEntry, rotateLogFile } from './util/log.js';
 
 /** launchd 服务标签 */
@@ -582,6 +583,8 @@ export async function runDaemon(opts = {}) {
   const startupCatchupMs = opts.startupCatchupMs ?? STARTUP_CATCHUP_MS;
   const distillFn = opts.distillFn || distill;
   const writebackFn = opts.writebackFn || runWriteback;
+  const compactFn = opts.compactFn || compact;
+  const compactDueFn = opts.compactDueFn || compactDue;
 
   logDaemon(
     'info',
@@ -660,14 +663,34 @@ export async function runDaemon(opts = {}) {
       }
       // pending === 0 且非兜底轮时无事发生，不打扰日志
 
-      if (distilledNew || isSweep) {
+      // wiki 全局归并（compact）：只在兜底/追赶轮且到期（缺省 24h）时触发，
+      // 避开活跃编辑窗口；归并产物登记 pending-writeback，由后续写回同步 App 侧
+      let compacted = false;
+      if (isSweep && compactDueFn(config)) {
+        try {
+          const c = await compactFn({ config });
+          if (!c.ok) {
+            logDaemon('warn', `[${reason}] compact 降级跳过（下轮重试）: ${c.error}`);
+          } else if ((c.merged?.length ?? 0) > 0) {
+            compacted = true;
+            logDaemon(
+              'info',
+              `[${reason}] compact 完成: ${c.clustersDone}/${c.clusters} 簇（LLM 调用 ${c.llmCalls} 次）→ 归并出 ${c.merged.length} 页、删除 ${c.removedPages.length} 页${c.error ? `（部分块失败: ${c.error}）` : ''}`,
+            );
+          }
+        } catch (err) {
+          logDaemon('warn', `[${reason}] compact 异常（跳过，下轮重试）: ${err.message}`);
+        }
+      }
+
+      if (distilledNew || compacted || isSweep) {
         const entries = wikiToEntries();
         if (entries.length > 0) {
           const w = await writebackFn({ config }); // 绝不传 forceBatch3，遵守 batch3Enabled 门禁
           const summary = (w.appResults || []).map((a) => `${a.app}:${a.status}`).join(', ');
           const noteworthy = (w.appResults || []).some((a) => a.status === 'written' || a.status === 'failed');
           // 兜底轮全为幂等跳过时不刷日志，避免每小时一条噪音
-          if (noteworthy || distilledNew) {
+          if (noteworthy || distilledNew || compacted) {
             logDaemon('info', `[${reason}] writeback 完成: ${entries.length} 条目（${summary || '无适配器'}）`);
           }
         }

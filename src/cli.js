@@ -10,6 +10,7 @@
  *   hub watch       前台监听增量摄取
  *   hub index       重建主索引（rebuildMasterIndex：全量收录 + hub-id 回填）
  *   hub distill     LLM 整理 sources → wiki
+ *   hub compact     wiki 全局归并：同主题近似页簇 LLM 归并为少数页（--dry-run 预览）
  *   hub writeback   wiki 并行写回各 App（默认增量；--full 全量；--repair 修复 codex 多标记区）
  *   hub doctor      健康度体检（纯只读，✅/⚠️/❌ 分级；--json 结构化输出）
  *   hub search      wiki 关键词检索（grep 级，多关键词 AND，大小写不敏感）
@@ -45,6 +46,7 @@ import { repairFile } from './adapters/codex.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
 import { searchWiki, formatSearchResults } from './search.js';
 import { distill, loadDistillState, applyTombstones } from './distill.js';
+import { compact } from './compact.js';
 import {
   runWriteback,
   formatWritebackSummary,
@@ -269,6 +271,57 @@ program
       console.log(`ℹ️ 尚余 ${result.totalBatches - result.batches} 批未处理，再次执行 hub distill 或等 daemon 下轮继续`);
     }
     console.log(`主索引已更新: ${result.index}`);
+  });
+
+// ---------------------------------------------------------------------------
+// hub compact —— wiki 全局归并：同主题近似页簇 LLM 归并为少数页
+// ---------------------------------------------------------------------------
+program
+  .command('compact')
+  .description('把 wiki 中同主题的近似重复页簇用 LLM 归并为少数页（输家页备份后删除，App 侧自动同步）')
+  .option('--dry-run', '只打印聚类计划（哪些页会被归并），不调 LLM、不落盘')
+  .option('--topic <key>', '定向只处理指定主题键（如 ab-test，试点验证用）')
+  .option('--max-clusters <n>', '本轮最多处理的簇数（缺省读 config.compact.maxClustersPerRun）', (v) => parseInt(v, 10))
+  .action(async (opts) => {
+    let result;
+    try {
+      result = await compact({ dryRun: !!opts.dryRun, topicKey: opts.topic, maxClusters: opts.maxClusters });
+    } catch (err) {
+      const hint = lockTimeoutHint(err);
+      console.error(hint ? `⚠️ ${hint}` : `⚠️ 归并失败: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!result.ok) {
+      const hint = lockTimeoutHint({ message: result.error });
+      console.error(hint ? `⚠️ ${hint}` : `⚠️ 归并失败（wiki 未动，下次可重试）: ${result.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (result.clusters === 0) {
+      console.log(result.message || '没有需要归并的近似主题簇');
+      return;
+    }
+    if (result.dryRun) {
+      console.log(`[dry-run] 共 ${result.clusters} 个可归并簇（不调 LLM、不落盘）：`);
+      for (const c of result.plan) {
+        console.log(`  - ${c.key}（${c.count} 页）: ${c.slugs.join(', ')}`);
+      }
+      return;
+    }
+    console.log(`✅ 归并完成：处理 ${result.clustersDone}/${result.clusters} 簇（LLM 调用 ${result.llmCalls} 次）→ 归并出 ${result.merged.length} 页，删除 ${result.removedPages.length} 页`);
+    for (const p of result.merged) {
+      console.log(`  - ${path.relative(storePaths.wiki, p)}`);
+    }
+    if (result.error) {
+      console.error(`⚠️ 部分块失败（已完成块不受影响，下轮重试）: ${result.error}`);
+    }
+    if (result.clusters > result.clustersDone) {
+      console.log(`ℹ️ 尚余 ${result.clusters - result.clustersDone} 簇未处理，再次执行 hub compact 或等 daemon 下轮继续`);
+    }
+    if (result.merged.length > 0) {
+      console.log(`主索引已更新: ${result.index}；App 侧将在下次写回时同步（或手动 hub writeback）`);
+    }
   });
 
 // ---------------------------------------------------------------------------

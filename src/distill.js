@@ -884,12 +884,17 @@ export function appendPendingWriteback(pages, updatedAt) {
   const file = pendingWritebackPath();
   return withLock(file, () => {
     const map = new Map();
+    let removals = [];
     try {
       const existing = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (existing && Array.isArray(existing.pages)) {
         for (const e of existing.pages) {
           if (e && e.path) map.set(String(e.path), new Set((e.hubIds || []).map(String)));
         }
+      }
+      // compact 登记的 App 侧待清理 hubId（removals）原样保留，不被本函数重写丢失
+      if (existing && Array.isArray(existing.removals)) {
+        removals = existing.removals.map(String);
       }
     } catch {
       // 不存在/已消费清空/损坏：从零开始
@@ -903,6 +908,7 @@ export function appendPendingWriteback(pages, updatedAt) {
     const out = {
       updatedAt: updatedAt || new Date().toISOString(),
       pages: [...map.entries()].map(([p, ids]) => ({ path: p, hubIds: [...ids] })),
+      ...(removals.length > 0 ? { removals } : {}),
     };
     atomicWrite(file, `${JSON.stringify(out, null, 2)}\n`, { mode: FILE_MODE });
     return out;

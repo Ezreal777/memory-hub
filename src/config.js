@@ -64,6 +64,14 @@ export function defaultConfig() {
     },
     // 蒸馏层配置：testMarkers 命中即视为测试产物（跳过蒸馏）
     distill: { testMarkers: [...DEFAULT_TEST_MARKERS] },
+    // wiki 全局归并（compact）：同主题近似页簇的 LLM 归并（详见 compact.js）
+    compact: {
+      enabled: true, // 到期后由 daemon 兜底扫描轮自动执行；false 则仅 hub compact 手动触发
+      intervalMs: 24 * 60 * 60 * 1000, // 自动归并最小间隔（24 小时）
+      minClusterSize: 3, // 主题簇 ≥ 该页数才归并
+      maxClustersPerRun: 4, // 单轮最多处理的簇数（控制 LLM 调用量，剩余下轮继续）
+      maxPagesPerCall: 8, // 单次 LLM 调用最多送入的页面数（大簇分块跨轮收敛）
+    },
     // daemon 事件驱动调度阈值（详见 daemon.js：达阈值提前整理，否则等 1 小时兜底扫描）
     daemon: {
       sweepIntervalMs: 60 * 60 * 1000, // 兜底全量扫描间隔（1 小时）
@@ -88,6 +96,7 @@ function mergeWithDefaults(raw) {
   merged.writeback = { ...def.writeback, ...(raw.writeback || {}) };
   merged.tombstone = { ...def.tombstone, ...(raw.tombstone || {}) };
   merged.distill = { ...def.distill, ...(raw.distill || {}) };
+  merged.compact = { ...def.compact, ...(raw.compact || {}) };
   merged.daemon = { ...def.daemon, ...(raw.daemon || {}) };
   // apps 逐条补齐字段，保证每个条目结构完整
   const apps = Array.isArray(raw.apps) && raw.apps.length > 0 ? raw.apps : def.apps;
@@ -168,6 +177,7 @@ export function updateConfig(patch = {}) {
     if (patch.writeback) merged.writeback = { ...config.writeback, ...patch.writeback };
     if (patch.tombstone) merged.tombstone = { ...config.tombstone, ...patch.tombstone };
     if (patch.distill) merged.distill = { ...config.distill, ...patch.distill };
+    if (patch.compact) merged.compact = { ...config.compact, ...patch.compact };
     if (patch.daemon) merged.daemon = { ...config.daemon, ...patch.daemon };
     saveConfig(merged);
     return merged;

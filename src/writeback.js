@@ -76,15 +76,18 @@ export function pendingWritebackPath() {
 }
 
 /**
- * 读取增量写回清单（H4）。契约（与 distill 侧逐字一致）：
- * {"updatedAt":"<ISO>","pages":[{"path":"<wiki文件名如 foo.md>","hubIds":["hub-..."]}]}
- * @returns {{ updatedAt: string, pages: { path: string, hubIds: string[] }[] }|null}
+ * 读取增量写回清单（H4）。契约（与 distill/compact 侧逐字一致）：
+ * {"updatedAt":"<ISO>","pages":[{"path":"<wiki文件名如 foo.md>","hubIds":["hub-..."]}],
+ *  "removals":["hub-..."]}（removals 为 compact 登记的 App 侧待清理 hubId，可缺省）
+ * @returns {{ updatedAt: string, pages: { path: string, hubIds: string[] }[], removals: string[] }|null}
  *   文件不存在/损坏/结构不符时返回 null（调用方降级全量）
  */
 export function loadPendingWriteback() {
   try {
     const raw = JSON.parse(fs.readFileSync(pendingWritebackPath(), 'utf8'));
-    if (raw && typeof raw === 'object' && Array.isArray(raw.pages)) return raw;
+    if (raw && typeof raw === 'object' && Array.isArray(raw.pages)) {
+      return { ...raw, removals: Array.isArray(raw.removals) ? raw.removals.map(String) : [] };
+    }
   } catch {
     // 不存在或损坏：降级全量
   }
@@ -117,7 +120,7 @@ export function clearPendingWriteback(expectedUpdatedAt) {
     }
     atomicWrite(
       file,
-      `${JSON.stringify({ updatedAt: new Date().toISOString(), pages: [] }, null, 2)}\n`,
+      `${JSON.stringify({ updatedAt: new Date().toISOString(), pages: [], removals: [] }, null, 2)}\n`,
       { mode: FILE_MODE },
     );
     return true;
@@ -567,16 +570,20 @@ export async function runWriteback(opts = {}) {
 
   // H4 增量写回：默认（非 full / 非定向 CLI 操作）消费 pending-writeback.json，
   // 只写回其中列出的页面；文件不存在/为空时降级全量并记一条日志。
+  // compact 联动：清单 removals 中的 hubId（被归并删除页的主 hubId）本轮顺带
+  // 做 App 侧旧渲染文件清理（removeEntries 先于写回执行，赢家页随后重写）。
   const incrementalEligible = !opts.full && !opts.fromSources && !opts.app && !opts.entry && !opts.removalsOnly;
   let incremental = false;
   let pendingUpdatedAt; // MUST-1：记住本轮消费的清单版本，清空时比对防误清 distill 新增页面
+  let compactRemovalIds = []; // compact 登记的 App 侧待清理 hubId（非 tombstone，不受 autoPropagate 门控）
   if (incrementalEligible) {
     const pending = loadPendingWriteback();
-    if (!pending || pending.pages.length === 0) {
+    if (!pending || (pending.pages.length === 0 && pending.removals.length === 0)) {
       logWriteback('info', 'pending-writeback.json 不存在或为空，降级全量写回');
     } else {
       incremental = true;
       pendingUpdatedAt = pending.updatedAt;
+      if (!opts.dryRun) compactRemovalIds = pending.removals;
       const wanted = new Set(pending.pages.map((p) => String(p.path)));
       // SHOULD-4 路径匹配收紧：basename 匹配仅对 wiki 根目录顶层文件生效，
       // 子目录页面只认相对 wiki 根的精确路径（防子目录同名碰撞）
@@ -584,7 +591,7 @@ export async function runWriteback(opts = {}) {
         if (wanted.has(path.relative(storePaths.wiki, e.file))) return true;
         return path.dirname(e.file) === storePaths.wiki && wanted.has(path.basename(e.file));
       });
-      if (entries.length === 0 && removalIds.length === 0) {
+      if (entries.length === 0 && removalIds.length === 0 && compactRemovalIds.length === 0) {
         // 清单页面已全部不存在（被删除/重命名）：清空防死循环（updatedAt 不一致时保留新增页面）
         const cleared = opts.dryRun ? false : clearPendingWriteback(pendingUpdatedAt);
         return {
@@ -600,7 +607,7 @@ export async function runWriteback(opts = {}) {
     }
   }
 
-  if (entries.length === 0 && removalIds.length === 0) {
+  if (entries.length === 0 && removalIds.length === 0 && compactRemovalIds.length === 0) {
     return {
       ok: true,
       mode: incremental ? 'incremental' : 'full',
@@ -661,12 +668,16 @@ export async function runWriteback(opts = {}) {
       logWriteback('error', parts.join(' —— '));
     }
 
-    // H4：全部启用 app 写回成功（无 failed 且无 deferred 条目）才清空增量清单，
-    // 否则保留下一轮重试（skipped 视为成功——幂等/门禁跳过不阻塞清空）。
+    // H4：全部启用 app 写回成功（无 failed 且无 deferred 条目，compact 清理无 deferred）
+    // 才清空增量清单，否则保留下一轮重试（skipped 视为成功——幂等/门禁跳过不阻塞清空）。
     // MUST-1：传入本轮消费的 updatedAt，若 distill 在写回窗口内已合并新页面则不清空。
     if (incremental) {
+      const compactSet = new Set(compactRemovalIds);
       const allOk = appResults.every(
-        (r) => r.status !== 'failed' && !(r.entries || []).some((e) => e.status === 'deferred'),
+        (r) =>
+          r.status !== 'failed' &&
+          !(r.entries || []).some((e) => e.status === 'deferred') &&
+          !(r.removed || []).some((e) => e.status === 'deferred' && compactSet.has(e.hubId)),
       );
       if (allOk) {
         clearPendingWriteback(pendingUpdatedAt);
@@ -701,10 +712,11 @@ export async function runWriteback(opts = {}) {
     logPath: opts.dryRun ? undefined : writebackLogPath(),
   };
 
-  /** 跨 App 并行、单 App 失败隔离熔断（Promise.allSettled） */
+  /** 跨 App 并行、单 App 失败隔离熔断（Promise.allSettled）；tombstone 与 compact 清理合并下发 */
   async function doWritebackPass() {
+    const allRemovalIds = [...new Set([...removalIds, ...compactRemovalIds])];
     const settled = await Promise.allSettled(
-      adapters.map((adapter) => runAppWriteback(adapter, entries, opts, config, removalIds)),
+      adapters.map((adapter) => runAppWriteback(adapter, entries, opts, config, allRemovalIds)),
     );
     return settled.map((s, i) => {
       const adapter = adapters[i];

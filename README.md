@@ -58,6 +58,7 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `hub watch` | 前台监听增量摄取（Ctrl-C 退出） |
 | `hub index` | 全量重建 `_index/master-index.md`（收录全部页面、头部计数用实际值、逐行回填页面 frontmatter 的 hub-id） |
 | `hub distill` | LLM 整理 sources → wiki（`--dry-run` / `--max-pages <n>`）；批内内容去重 / 测试标记快照过滤 / 相似主题优先并入既有页，每轮成功后自动重建主索引并登记 `state/pending-writeback.json` 增量写回清单 |
+| `hub compact` | wiki 全局归并：同主题近似页簇用 LLM 归并为少数页（`--dry-run` 只出聚类计划 / `--topic <key>` 定向试点 / `--max-clusters <n>`）；输家页备份后删除，赢家页登记增量写回、输家页主 hubId 登记 removals 由写回侧清理 App 侧旧渲染；到期后 daemon 兜底轮自动执行（见 config.compact） |
 | `hub writeback` | wiki 条目并行写回各 App（`--app` / `--entry` / `--dry-run` / `--from-sources` / `--force-batch3`）；默认增量：消费 `state/pending-writeback.json` 只写回其中列出的页面，全部成功后原子清空，清单缺失/为空时降级全量并记日志；`--full` 强制全量广播；`--repair` 修复 codex AGENTS.md 多标记区（见下） |
 | `hub doctor` | 健康度体检（纯只读，✅/⚠️/❌ 分级；`--json` 结构化输出；有 ❌ 时退出码非零） |
 | `hub search <关键词…>` | wiki 全文检索（grep 级；多关键词 AND，大小写不敏感；`--limit <n>` 缺省 20） |
@@ -92,6 +93,10 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `tombstone.stormThreshold` | 删除风暴熔断阈值（缺省 20）：单个适配器一个窗口内登记数超过即熔断 |
 | `tombstone.stormWindowMs` | 风暴熔断窗口时长（缺省 600000 = 10 分钟） |
 | `distill.testMarkers` | 蒸馏「测试标记」清单（缺省 `HUB-TEST` / `冒烟测试` / `N4 冒烟` / `N4冒烟`）：快照标题/正文命中任一标记即视为测试产物跳过蒸馏 |
+| `compact.enabled` | wiki 全局归并自动化开关（缺省 `true`）：到期后由 daemon 兜底/追赶轮自动执行；`false` 时仅 `hub compact` 手动触发 |
+| `compact.intervalMs` | 自动归并最小间隔（缺省 24 小时） |
+| `compact.minClusterSize` | 主题簇 ≥ 该页数才归并（缺省 3） |
+| `compact.maxClustersPerRun` / `compact.maxPagesPerCall` | 单轮最多处理簇数（缺省 4）/ 单次 LLM 调用最多送入页数（缺省 8，大簇分块跨轮收敛） |
 | `llm.baseUrl` / `llm.model` | OpenAI 兼容 LLM 端点与模型（`hub keys use` 可一并配置） |
 | `llm.keyRef` | Keychain 密钥引用名（密钥本体只在 Keychain，绝不落盘） |
 
