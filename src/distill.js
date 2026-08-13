@@ -37,6 +37,7 @@ import {
   removeTombstones,
   updateTombstones,
   listSnapshotMeta,
+  ECHO_MARKER_RE,
 } from './hub-store.js';
 import { slugify, sha256Of } from './adapters/base.js';
 import { loadConfig, DEFAULT_TEST_MARKERS } from './config.js';
@@ -360,6 +361,8 @@ function readSnapshot(file, ctx = {}) {
     app: String(parsed.data?.app || ''),
     title: String(parsed.data?.title || ''),
     ingestedAt: String(parsed.data?.ingestedAt || ''),
+    // 原 App frontmatter 的 JSON 字符串（摄取时存入），供回声兜底判定等使用
+    rawFrontmatter: String(parsed.data?.frontmatter || ''),
     body: lines.join('\n').trim(),
   };
 }
@@ -396,6 +399,21 @@ export function listUnprocessedSnapshots(state, opts = {}) {
  * 运行时以 config.distill.testMarkers 为准；此处 re-export 保持既有导出兼容。
  */
 export const TEST_MARKERS = DEFAULT_TEST_MARKERS;
+
+/**
+ * 回声兜底判定（与 hub-store.isEchoEntry 同口径，作用于已落盘快照）：
+ * 采集层护栏上线前已漏进 sources 的 hub 自写渲染产物，蒸馏前识别并标
+ * processed（skipped:'echo'），不烧 token 不进 wiki，阻断回声循环的存量尾巴。
+ * @param {Object} snap readSnapshot 产物（含 body/rawFrontmatter）
+ * @returns {boolean}
+ */
+export function hasEchoMarker(snap) {
+  if (ECHO_MARKER_RE.test(String(snap?.body || ''))) return true;
+  const rawFm = String(snap?.rawFrontmatter || '');
+  if (/"chatId":\s*"hub-\d{14}-/.test(rawFm)) return true;
+  if (/"source":\s*"memory-hub"/.test(rawFm)) return true;
+  return false;
+}
 
 /**
  * 判断快照是否携带测试标记。
@@ -1175,6 +1193,22 @@ export async function distill(opts = {}) {
       );
     }
     saveDistillState(state);
+  }
+
+  // 回声兜底：hub 自写渲染产物（采集护栏上线前漏进的存量）直接标 processed 跳过，
+  // 不烧 token 不进 wiki；汇总记一条日志（存量可达万条，不逐条刷日志）
+  const echoSkipped = snapshots.filter((s) => hasEchoMarker(s));
+  snapshots = snapshots.filter((s) => !hasEchoMarker(s));
+  if (!opts.dryRun && echoSkipped.length > 0) {
+    const now = new Date().toISOString();
+    for (const s of echoSkipped) {
+      state.processed[s.hubId] = { page: '', at: now, skipped: 'echo' };
+    }
+    saveDistillState(state);
+    appendLogEntry(
+      distillLogPath(),
+      `${now}\tinfo\t回声快照跳过蒸馏 ${echoSkipped.length} 条（hub 自写写回产物，已标 processed skipped:echo）`,
+    );
   }
 
   if (snapshots.length === 0) {

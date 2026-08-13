@@ -30,6 +30,7 @@ import {
   harvest,
   addTombstonesGuarded,
   findSnapshotHubIdsBySource,
+  isEchoEntry,
 } from './hub-store.js';
 import { consumeInflight, loadInflightEntries, loadDirWindows } from './inflight.js';
 import { appendLogEntry } from './util/log.js';
@@ -324,8 +325,11 @@ export class Watcher {
       return;
     }
 
-    // 判定为新增或内容变化 → 解析并摄取
-    const entries = adapter.parse(meta);
+    // 判定为新增或内容变化 → 解析并摄取（回声护栏与 harvest 同口径：
+    // hub 自写内容被 App 重组/追加后绕过 inflight，按内容指纹拦截）
+    const parsed = adapter.parse(meta);
+    const entries = parsed.filter((entry) => !isEchoEntry(entry));
+    const echoSkipped = parsed.length - entries.length;
     for (const entry of entries) {
       ingest(adapter, entry, { recordState: false });
     }
@@ -333,7 +337,7 @@ export class Watcher {
     logWatcher(
       adapter.id,
       filePath,
-      `${event} 摄取 ${entries.length} 条快照`,
+      `${event} 摄取 ${entries.length} 条快照${echoSkipped > 0 ? `（回声跳过 ${echoSkipped} 条）` : ''}`,
     );
     if (entries.length > 0) {
       const bytes = entries.reduce((n, e) => n + String(e.body || '').length, 0);

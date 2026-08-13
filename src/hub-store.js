@@ -432,13 +432,41 @@ function yamlScalar(v) {
   return JSON.stringify(String(v ?? ''));
 }
 
+// ---------------------------------------------------------------------------
+// 回声护栏（echo guard）：防 hub 自己写回的渲染产物被重新摄取
+// ---------------------------------------------------------------------------
+
+/** hub 写回渲染标记：正文中的 [hub-YYYYMMDDHHMMSS-xxxxxx]（genHubId 格式） */
+export const ECHO_MARKER_RE = /\[hub-\d{14}-[a-z0-9]{6}\]/;
+
+/**
+ * 判定一条解析出的记忆条目是否为 hub 自己写回的渲染产物（回声）。
+ * 背景：inflight 回环抑制只认「路径+hash」，App 客户端重组目录（qoder 跨
+ * category 挪文件）或向同一文件追加内容（qoderwork daily/codex AGENTS.md）后
+ * 路径或 hash 变化即绕过，自产内容会被当新记忆重新摄取，形成
+ * 「写回→采集→蒸馏→再写回」的回声循环（实测单日膨胀 1.3 万条快照）。
+ * 三类内容级指纹（命中任一即回声）：
+ * - 正文含 [hub-…] 渲染标记（qoder/claude/codex 写回体首行/块标记）；
+ * - frontmatter.chatId 为 hub- 前缀（qoderwork daily 块的 memory-chat id）；
+ * - frontmatter.source === 'memory-hub'（qoder 写回 frontmatter 固定字段）。
+ * @param {Object} entry 适配器 parse 产出的 Entry
+ * @returns {boolean}
+ */
+export function isEchoEntry(entry) {
+  if (ECHO_MARKER_RE.test(String(entry?.body || ''))) return true;
+  const fm = entry?.frontmatter || {};
+  if (/^hub-\d{14}-/.test(String(fm.chatId || ''))) return true;
+  if (String(fm.source || '') === 'memory-hub') return true;
+  return false;
+}
+
 /**
  * 对单个适配器做全量/增量摄取对账（供首启全量摄取与轮询兜底复用）。
- * 流程：getChangedFiles → 逐个 read + parse → 逐条 ingest → 文件级 recordFile →
+ * 流程：getChangedFiles → 逐个 read + parse → 回声过滤 → 逐条 ingest → 文件级 recordFile →
  * removed 文件清理状态。
  * @param {Object} adapter 适配器实例
- * @returns {{ ingested: number, files: number, removed: number, bytes: number }}
- *   bytes 为本轮摄取正文体积估算（供 daemon 事件阈值计量）
+ * @returns {{ ingested: number, files: number, removed: number, bytes: number, echoSkipped: number }}
+ *   bytes 为本轮摄取正文体积估算（供 daemon 事件阈值计量）；echoSkipped 为回声跳过数
  */
 export function harvest(adapter) {
   ensureHubStore();
@@ -446,6 +474,7 @@ export function harvest(adapter) {
   const targets = [...added, ...modified];
   let ingested = 0;
   let bytes = 0;
+  let echoSkipped = 0;
   for (const filePath of targets) {
     const raw = adapter.read(filePath);
     if (!raw) continue;
@@ -462,6 +491,12 @@ export function harvest(adapter) {
     }
     const entries = adapter.parse(raw);
     for (const entry of entries) {
+      // 回声护栏：hub 自己写回的渲染产物被 App 重组/追加后绕过 inflight，
+      // 按内容指纹拦截，绝不重新摄取（防写回→采集→蒸馏的回声循环）
+      if (isEchoEntry(entry)) {
+        echoSkipped += 1;
+        continue;
+      }
       ingest(adapter, entry, { recordState: false });
       ingested += 1;
       bytes += String(entry.body || '').length;
@@ -472,7 +507,7 @@ export function harvest(adapter) {
   for (const p of removed) {
     removeFileState(p);
   }
-  return { ingested, files: targets.length, removed: removed.length, bytes };
+  return { ingested, files: targets.length, removed: removed.length, bytes, echoSkipped };
 }
 
 // ---------------------------------------------------------------------------

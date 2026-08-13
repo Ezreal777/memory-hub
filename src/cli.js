@@ -11,6 +11,7 @@
  *   hub index       重建主索引（rebuildMasterIndex：全量收录 + hub-id 回填）
  *   hub distill     LLM 整理 sources → wiki
  *   hub compact     wiki 全局归并：同主题近似页簇 LLM 归并为少数页（--dry-run 预览）
+ *   hub eval        记忆效果评测：generate 出探针题 / coverage 各端到达率 / report 总报告
  *   hub writeback   wiki 并行写回各 App（默认增量；--full 全量；--repair 修复 codex 多标记区）
  *   hub doctor      健康度体检（纯只读，✅/⚠️/❌ 分级；--json 结构化输出）
  *   hub search      wiki 关键词检索（grep 级，多关键词 AND，大小写不敏感）
@@ -47,6 +48,7 @@ import { runDoctor, formatDoctorReport } from './doctor.js';
 import { searchWiki, formatSearchResults } from './search.js';
 import { distill, loadDistillState, applyTombstones } from './distill.js';
 import { compact } from './compact.js';
+import { generateProbes, coverageCheck, pipelineMetrics, loadProbes, formatEvalReport } from './eval.js';
 import {
   runWriteback,
   formatWritebackSummary,
@@ -322,6 +324,62 @@ program
     if (result.merged.length > 0) {
       console.log(`主索引已更新: ${result.index}；App 侧将在下次写回时同步（或手动 hub writeback）`);
     }
+  });
+
+// ---------------------------------------------------------------------------
+// hub eval —— 记忆效果评测：探针题生成 / 各端覆盖度 / 总报告
+// ---------------------------------------------------------------------------
+const evalCmd = program.command('eval').description('记忆效果评测：探针题生成、各 App 记忆可达性检测与总报告');
+
+evalCmd
+  .command('generate')
+  .description('从 wiki 抽样生成事实探针题（LLM 出题，覆盖既有探针集）')
+  .option('--count <n>', '探针题数（缺省 20）', (v) => parseInt(v, 10))
+  .action(async (opts) => {
+    const r = await generateProbes({ count: opts.count });
+    if (!r.ok) {
+      console.error(`⚠️ 探针生成失败: ${r.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`✅ 已生成 ${r.probes.length} 道探针题（抽样 ${r.sampledPages} 页，LLM 调用 ${r.llmCalls} 次）`);
+    for (const p of r.probes) {
+      console.log(`  ${p.id}. ${p.question}`);
+    }
+  });
+
+evalCmd
+  .command('coverage')
+  .description('检测探针判据在各 App 记忆语料中的到达率（确定性，零 LLM 成本）')
+  .option('--json', '输出结构化 JSON（含逐题命中明细）')
+  .action((opts) => {
+    const r = coverageCheck();
+    if (!r.ok) {
+      console.error(`⚠️ ${r.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.json) {
+      console.log(JSON.stringify(r, null, 2));
+      return;
+    }
+    console.log(formatEvalReport({ coverage: r }));
+  });
+
+evalCmd
+  .command('report')
+  .description('输出完整评测报告（管道指标 + 覆盖度 + 盲测清单）')
+  .option('--json', '输出结构化 JSON')
+  .action((opts) => {
+    const metrics = pipelineMetrics();
+    const coverage = coverageCheck();
+    const probes = loadProbes()?.probes || [];
+    if (opts.json) {
+      console.log(JSON.stringify({ metrics, coverage: coverage.ok ? coverage : { error: coverage.error }, probes }, null, 2));
+      return;
+    }
+    console.log(formatEvalReport({ metrics, coverage: coverage.ok ? coverage : undefined, probes }));
+    if (!coverage.ok) console.log(`\nℹ️ 覆盖度未检测：${coverage.error}`);
   });
 
 // ---------------------------------------------------------------------------
