@@ -14,6 +14,8 @@
  * 写回侧（batch:3，高风险批次，默认禁用，需 config.writeback.batch3Enabled=true）：
  * - 【只追加】当天 memory/YYYY-MM-DD.md（不存在则创建），内容用
  *   `<!-- memory-chat:<hubId> -->` 与 `<!-- /memory-chat:<hubId> -->` 包裹，模拟原生 daily 格式；
+ * - 幂等检查跨全部 daily 文件（非仅当天）：早先写入的条目隔天不重写，
+ *   防每日首轮全量写回把整个 wiki 重灌一遍（日记式目标：已写块不随 wiki 更新重写）；
  * - 绝不写 MEMORY.md / USER.md / SOUL.md 与任何索引文件；
  * - verify 后提示：需新会话对账或手动重建搜索索引才可被检索。
  */
@@ -26,6 +28,14 @@ import { statSafe, writeFilesSafely } from './write-utils.js';
 /** 写回成功后的固定提示（索引型，需对账/重建索引） */
 export const QODERWORK_WRITE_NOTE =
   '写入 daily memory 后需 QoderWork 新会话或手动重建搜索索引才可被检索';
+
+/**
+ * 单个 daily 文件的 memory-chat 块数配额：防首次全量写回把整个 wiki 一次性
+ * 灌爆当天文件（几 MB 的单日记录会拖垮 QoderWork 的会话加载与索引）。
+ * 超额条目本轮 skipped（非 deferred，不阻塞增量清单清空），由后续兜底轮的
+ * 全量写回逐日续填，存量涓流式回填。
+ */
+export const QODERWORK_DAILY_QUOTA = 100;
 
 /**
  * 当天日期串 YYYY-MM-DD（本地时区）。
@@ -217,14 +227,34 @@ export class QoderworkAdapter extends BaseAdapter {
     const dateStr = todayStr();
     for (const dir of this.memoryPaths) {
       const dailyPath = path.join(dir, 'memory', `${dateStr}.md`);
+      // 每日配额基数：当天文件已有的 memory-chat 块数（含 QoderWork 自己写的）
+      let todayBlocks = 0;
+      try {
+        todayBlocks = (fs.readFileSync(dailyPath, 'utf8').match(/<!--\s*memory-chat:/g) || []).length;
+      } catch {
+        todayBlocks = 0;
+      }
       for (const entry of entries) {
         // H2b：读取前抓取 mtime/size 快照，写前二次比对，防 App/用户并发追加被覆盖
         const preStat = statSafe(dailyPath);
         const existing = fs.existsSync(dailyPath) ? fs.readFileSync(dailyPath, 'utf8') : '';
 
-        // 幂等：已含该 hub-id 的 memory-chat 块 → 跳过
-        if (existing.includes(`memory-chat:${entry.hubId}`)) {
-          results.push({ hubId: entry.hubId, status: 'skipped', targets: [dailyPath], reason: '已含 hub-id 标记' });
+        // 幂等：跨全部 daily 文件查该 hub-id 的 memory-chat 块（早先写在历史日期
+        // 文件里的条目隔天不重写，防每日首轮全量写回重灌整个 wiki）
+        const priorFile = this.findEntryDailyFile(dir, entry.hubId);
+        if (priorFile) {
+          results.push({ hubId: entry.hubId, status: 'skipped', targets: [priorFile], reason: '已含 hub-id 标记' });
+          continue;
+        }
+
+        // 每日配额：当天块数已满 → 本轮跳过（后续全量轮逐日续填，存量涓流式回填）
+        if (todayBlocks >= QODERWORK_DAILY_QUOTA) {
+          results.push({
+            hubId: entry.hubId,
+            status: 'skipped',
+            targets: [dailyPath],
+            reason: `当日写入配额已满（${QODERWORK_DAILY_QUOTA} 块/天，防灌爆 daily 文件），后续轮次续写`,
+          });
           continue;
         }
 
@@ -254,35 +284,54 @@ export class QoderworkAdapter extends BaseAdapter {
           throw err;
         }
         results.push({ hubId: entry.hubId, status: 'written', targets: [dailyPath], backupDir, note: QODERWORK_WRITE_NOTE });
+        todayBlocks += 1;
       }
     }
     return results;
   }
 
   /**
-   * 写回后校验：当天 daily 文件中成对 memory-chat 标记均存在。
+   * 跨全部 daily 文件查找含指定 hubId memory-chat 标记的文件（幂等/校验共用）。
+   * @param {string} dir memory_paths 根目录（awareness/main）
+   * @param {string} hubId
+   * @returns {string|null} 命中的 daily 文件绝对路径；无命中 null
+   */
+  findEntryDailyFile(dir, hubId) {
+    const files = listDirFiles(path.join(dir, 'memory'), (name) => name.endsWith('.md'));
+    for (const f of files) {
+      try {
+        if (fs.readFileSync(f, 'utf8').includes(`memory-chat:${hubId}`)) return f;
+      } catch {
+        // 单文件不可读不影响查找
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 写回后校验：跨全部 daily 文件查成对 memory-chat 标记（与幂等同口径）；
+   * 返回 failedIds 供写回侧按条目粒度回滚（N3）。
    * @param {Object[]} entries Entry[]
-   * @returns {{ ok: boolean, reasons: string[] }}
+   * @returns {{ ok: boolean, reasons: string[], failedIds: string[] }}
    */
   verify(entries) {
     const reasons = [];
-    const dateStr = todayStr();
+    const failedIds = new Set();
     for (const dir of this.memoryPaths) {
-      const dailyPath = path.join(dir, 'memory', `${dateStr}.md`);
-      if (!fs.existsSync(dailyPath)) {
-        reasons.push(`${dailyPath} 不存在`);
-        continue;
-      }
-      const content = fs.readFileSync(dailyPath, 'utf8');
       for (const entry of entries) {
-        if (!content.includes(`memory-chat:${entry.hubId}`)) {
-          reasons.push(`${dailyPath} 缺少 memory-chat:${entry.hubId} 块`);
+        // 跨全部 daily 文件校验（与幂等同口径）：早先写在历史日期文件的条目不误判
+        const hit = this.findEntryDailyFile(dir, entry.hubId);
+        if (!hit) {
+          reasons.push(`[${path.join(dir, 'memory')}] 跨全部 daily 文件未找到 memory-chat:${entry.hubId} 块`);
+          failedIds.add(entry.hubId);
+          continue;
         }
-        if (!content.includes(`/memory-chat:${entry.hubId}`)) {
-          reasons.push(`${dailyPath} 缺少闭合标记 /memory-chat:${entry.hubId}`);
+        if (!fs.readFileSync(hit, 'utf8').includes(`/memory-chat:${entry.hubId}`)) {
+          reasons.push(`${hit} 缺少闭合标记 /memory-chat:${entry.hubId}`);
+          failedIds.add(entry.hubId);
         }
       }
     }
-    return { ok: reasons.length === 0, reasons };
+    return { ok: reasons.length === 0, reasons, failedIds: [...failedIds] };
   }
 }

@@ -338,6 +338,67 @@ test('qoderwork：只追加当天 memory/YYYY-MM-DD.md，绝不写 MEMORY.md，�
   assert.equal(daily2.match(/memory-chat:hub-20260805-qw0001/g).length, 2, '开闭标记各仅一次');
 });
 
+test('qoderwork：幂等与校验跨全部 daily 文件（昨天写过的条目隔天不重灌）', async () => {
+  freshHubRoot();
+  const home = freshFakeHome();
+  const main = path.join(home, '.qoderwork/awareness/main');
+
+  // 模拟昨天已写入的条目（历史日期 daily 文件里已有成对标记）
+  writeAt(home, '.qoderwork/awareness/main/memory/2026-01-02.md', [
+    '<!-- memory-chat:hub-20260805-qw0002 -->',
+    '## Session: 昨天写的会话',
+    '旧内容。',
+    '<!-- /memory-chat:hub-20260805-qw0002 -->',
+    '',
+  ].join('\n'));
+
+  const adapter = new QoderworkAdapter({ id: 'qoderwork', enabled: true, memory_paths: [main] });
+  const entry = mkEntry('hub-20260805-qw0002', '昨天写的会话', '新一轮全量写回的同一条目。');
+
+  // 隔天重放：跳过，不在今天的 daily 文件里重写
+  const r = await adapter.write([entry]);
+  assert.equal(r[0].status, 'skipped', '历史 daily 已含条目应跳过');
+  assert.match(r[0].targets[0], /2026-01-02\.md$/, '命中的是历史日期文件');
+  assert.ok(!fs.existsSync(path.join(main, 'memory', `${todayStr()}.md`)), '今天的 daily 文件不应被创建');
+
+  // 校验同口径：历史文件里的条目不误判为缺失
+  const check = adapter.verify([entry]);
+  assert.equal(check.ok, true, '跨文件校验应通过');
+  assert.deepEqual(check.failedIds, [], '无失败条目');
+
+  // 真正缺失的条目仍能报出 failedIds（N3 按条目回滚依据）
+  const missing = mkEntry('hub-20260805-qw9999', '不存在的条目', '正文');
+  const check2 = adapter.verify([missing]);
+  assert.equal(check2.ok, false);
+  assert.deepEqual(check2.failedIds, ['hub-20260805-qw9999']);
+});
+
+test('qoderwork：每日配额防灌爆——超额条目 skipped 后续轮次续写', async () => {
+  freshHubRoot();
+  const home = freshFakeHome();
+  const main = path.join(home, '.qoderwork/awareness/main');
+  const { QODERWORK_DAILY_QUOTA } = await import('../src/adapters/qoderwork.js');
+
+  // 当天文件预填到只剩 1 个配额
+  const blocks = [];
+  for (let i = 0; i < QODERWORK_DAILY_QUOTA - 1; i += 1) {
+    blocks.push(`<!-- memory-chat:native-${i} -->`, `块 ${i}`, `<!-- /memory-chat:native-${i} -->`, '');
+  }
+  writeAt(home, `.qoderwork/awareness/main/memory/${todayStr()}.md`, blocks.join('\n'));
+
+  const adapter = new QoderworkAdapter({ id: 'qoderwork', enabled: true, memory_paths: [main] });
+  const e1 = mkEntry('hub-20260805-quota1', '配额内条目', '能写入。');
+  const e2 = mkEntry('hub-20260805-quota2', '超额条目', '本轮该跳过。');
+
+  const r = await adapter.write([e1, e2]);
+  assert.equal(r[0].status, 'written', '配额内正常写入');
+  assert.equal(r[1].status, 'skipped', '超额条目跳过');
+  assert.match(r[1].reason, /配额已满/);
+  const daily = fs.readFileSync(path.join(main, 'memory', `${todayStr()}.md`), 'utf8');
+  assert.ok(daily.includes('memory-chat:hub-20260805-quota1'));
+  assert.ok(!daily.includes('memory-chat:hub-20260805-quota2'), '超额条目未落盘');
+});
+
 // ---------------------------------------------------------------------------
 // 6. wukong：时间戳段追加、幂等、只读配置、锁/同步忙碌延迟重试后放弃
 // ---------------------------------------------------------------------------
