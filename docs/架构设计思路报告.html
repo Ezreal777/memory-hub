@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Hub 架构设计思路报告</title>
+<style>
+  :root {
+    --ink: #1a202c; --sub: #4a5568; --line: #e2e8f0; --bg: #ffffff;
+    --accent: #4f6ef7; --accent-soft: #eef2ff; --warn: #b45309; --warn-soft: #fffbeb;
+    --code-bg: #f6f8fa; --card: #fafbfc;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 15px;
+  }
+  .page { max-width: 920px; margin: 0 auto; padding: 48px 32px 96px; }
+  header.hero { border-bottom: 3px solid var(--accent); padding-bottom: 24px; margin-bottom: 40px; }
+  header.hero h1 { font-size: 30px; margin: 0 0 12px; letter-spacing: .5px; }
+  header.hero .meta { color: var(--sub); font-size: 13px; }
+  header.hero .meta span { margin-right: 18px; }
+  h2 {
+    font-size: 21px; margin: 48px 0 16px; padding-left: 12px;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 16.5px; margin: 28px 0 10px; color: var(--ink); }
+  p { margin: 10px 0; }
+  strong { color: var(--ink); }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--accent-soft); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--card); }
+  code {
+    background: var(--code-bg); padding: 1px 6px; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px 18px; overflow-x: auto; font-size: 13px; line-height: 1.6;
+  }
+  pre code { background: none; padding: 0; }
+  ul, ol { padding-left: 24px; }
+  li { margin: 6px 0; }
+  .callout {
+    background: var(--accent-soft); border-left: 4px solid var(--accent);
+    padding: 12px 18px; border-radius: 0 8px 8px 0; margin: 18px 0;
+  }
+  .callout.warn { background: var(--warn-soft); border-color: var(--warn); }
+  .flowbox { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 8px 20px; margin: 18px 0; overflow-x: auto; }
+  pre.flow { background: none; border: none; padding: 8px 0; font-size: 13px; line-height: 1.5; }
+  .principles { counter-reset: pr; }
+  .principles li { list-style: none; position: relative; padding-left: 8px; margin: 10px 0; }
+  .principles li::before {
+    counter-increment: pr; content: counter(pr);
+    position: absolute; left: -26px; top: 2px; width: 22px; height: 22px; line-height: 22px;
+    background: var(--accent); color: #fff; border-radius: 50%; text-align: center; font-size: 12px; font-weight: 700;
+  }
+  footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--sub); font-size: 12.5px; }
+  @media print { .page { padding: 0; } h2 { break-after: avoid; } table, pre, .mermaid { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="hero">
+  <h1>Memory Hub 架构设计思路报告</h1>
+  <div class="meta">
+    <span>版本 v1.0 · 2026-08-13</span>
+    <span>代码规模 ≈11500 行 src + 219 个测试用例</span>
+    <span>运行形态 macOS 本地 CLI + launchd 守护</span>
+  </div>
+</header>
+
+<h2>1. 问题定义：AI 记忆孤岛</h2>
+<p>同时使用多个 AI 编程助手（Claude Code、Codex、Qoder、QoderWork、悟空）时，每家都有自己的记忆系统，但互不相通：</p>
+<ul>
+  <li>在 Claude Code 里教会的业务口径（如"转人工率分母用 xxx 字段"），换到 Qoder 里要重新解释一遍；</li>
+  <li>同一个坑（如 <code>robot_version</code> vs <code>agent_num</code>）在每个工具里各踩一次；</li>
+  <li>记忆散落在 5 处，没有一份可检索、可维护的全局知识库。</li>
+</ul>
+<div class="callout"><strong>Memory Hub 要解决的核心问题：让任何一端学到的知识，自动出现在所有端的原生记忆里。</strong></div>
+
+<h2>2. 核心设计理念：同步总线，而非中央图书馆</h2>
+<p>业界同类产品（如 basic-memory）的主流思路是"中央图书馆"——建一个新的统一记忆库，所有 AI 通过 MCP 协议在会话运行时来查。Memory Hub 选择了相反的路线：</p>
+<table>
+  <tr><th>维度</th><th>中央图书馆（MCP 拉模型）</th><th>Memory Hub（同步总线，推模型）</th></tr>
+  <tr><td>记忆积累</td><td>依赖模型"记得调工具存笔记"</td><td>watcher 事件驱动全自动采集，零纪律要求</td></tr>
+  <tr><td>记忆检索</td><td>每次会话调 MCP 工具（token+延迟）</td><td>写回各 App <strong>原生记忆位</strong>，开会话即加载，零运行时成本</td></tr>
+  <tr><td>App 接入</td><td>每个客户端配 MCP</td><td>每个 App 写一个文件级适配器</td></tr>
+  <tr><td>非 MCP 应用</td><td>接不进</td><td>悟空/QoderWork 等封闭应用照样打通</td></tr>
+  <tr><td>一致性</td><td>单一真相源，无同步问题</td><td>N+1 副本，同步是永恒战场（见 §5）</td></tr>
+</table>
+<div class="callout"><strong>取舍的本质</strong>：用"适配器维护成本 + 同步复杂度"，换"零使用摩擦"。用户和模型都不需要改变任何习惯——这是个人基础设施（而非产品）场景下的最优解。</div>
+
+<h2>3. 总体架构</h2>
+<h3>3.1 分层与数据流</h3>
+<div class="flowbox">
+<pre class="flow">
+ ┌────────────── 五端 App 原生记忆 ──────────────┐
+ │ Claude Code   memory/*.md                  │
+ │ Codex         AGENTS.md 标记区             │
+ │ Qoder         knowledge 分类目录           │
+ │ QoderWork     daily memory-chat 块         │
+ │ 悟空          MEMORY.md（readOnly 只采集） │
+ └─────┬────────────────────────▲─────────┘
+       │ 读（事件驱动）              │ 写回（各家原生格式渲染）
+       ▼                            │
+   watcher ─▶ sources/ ─▶ distill ─▶ wiki/ ◀─▶ compact
+   摄取对账    原始快照     LLM蒸馏    唯一权威份  全局归并
+              （只增不改）            │
+                                      ▼
+                                  writeback（增量契约 pending）
+</pre>
+</div>
+
+<h3>3.2 模块职责</h3>
+<table>
+  <tr><th>层</th><th>模块</th><th>职责</th></tr>
+  <tr><td>采集</td><td><code>watcher.js</code> + <code>adapters/*</code></td><td>FSEvents 监听 + 60s 轮询对账双保险；适配器负责"读懂"各家格式</td></tr>
+  <tr><td>存储</td><td><code>hub-store.js</code></td><td>sources 快照（只增不改、hubId 全局唯一键）、hash-state 指纹对账、tombstone 登记</td></tr>
+  <tr><td>蒸馏</td><td><code>distill.js</code></td><td>LLM 把快照归并为主题 wiki 页：语义去重、冲突双方保留、批次化调用</td></tr>
+  <tr><td>养护</td><td><code>compact.js</code></td><td>跨页面全局归并：主题键聚类 + LLM 分块重组，对抗知识库碎片化</td></tr>
+  <tr><td>写回</td><td><code>writeback.js</code> + <code>adapters/*</code></td><td>wiki → 各家原生格式；增量契约、跨 App 并行、失败隔离</td></tr>
+  <tr><td>守护</td><td><code>daemon.js</code></td><td>launchd 常驻：事件阈值触发 + 兜底扫描 + 启动追赶</td></tr>
+  <tr><td>观测</td><td><code>doctor.js</code> / <code>eval.js</code> / <code>search.js</code></td><td>健康体检、三层效果评测、全文检索</td></tr>
+</table>
+
+<h3>3.3 关键数据契约</h3>
+<ul>
+  <li><strong>hubId</strong>（<code>hub-YYYYMMDDHHMMSS-xxxxxx</code>）：一条记忆的全局唯一身份，贯穿快照 → wiki 页 frontmatter → 各 App 写回体标记，是幂等、对账、删除传播的锚点；</li>
+  <li><strong><code>state/pending-writeback.json</code></strong>：distill/compact 与 writeback 之间的增量契约（<code>pages[]</code> 待写回 + <code>removals[]</code> 待清理），全部成功才原子清空，否则保留重试；</li>
+  <li><strong>wiki 页 frontmatter</strong>：<code>hub-id[]</code>（归并来源）、<code>category</code>（qoder 分类依赖）、<code>deleted</code>（tombstone 标记），使每页可幂等重放。</li>
+</ul>
+
+<h2>4. 关键设计决策记录（ADR）</h2>
+<h3>ADR-1：写回各家原生格式，而不是统一格式</h3>
+<p>每个适配器都实现 <code>render()</code>：Claude 双文件（条目 + MEMORY.md 索引行）、Codex AGENTS.md 标记区、Qoder 四字段 frontmatter 分类文件、QoderWork memory-chat 注释块。<strong>代价</strong>是 5 套渲染逻辑；<strong>收益</strong>是各 App 把写回内容当自家记忆加载，零运行时成本。这是整个系统的立身之本，不可妥协。</p>
+<h3>ADR-2：LLM 蒸馏而非原文搬运</h3>
+<p>原始快照直接互相搬运会导致：重复内容爆炸、各家格式噪音互相污染、无全局视角。引入 LLM 蒸馏层做语义去重和主题归并，wiki 成为"被养护的知识库"而非"日志堆"。<strong>代价</strong>：token 成本（免费额度内运行）+ LLM 输出不可信（用 §5 的防御机制兜住）。</p>
+<h3>ADR-3：wiki 是唯一权威份，App 侧副本可全量重建</h3>
+<p>所有 App 侧写回内容都可由 wiki 重新渲染生成（<code>hub writeback --full</code>）。任何一端副本损坏/丢失都不是灾难，恢复路径永远存在。反向不成立：wiki 只从 sources 蒸馏而来，sources 只增不改，构成"原始层 → 权威层 → 副本层"的单向可重建链。</p>
+<h3>ADR-4：绝不信任 LLM 的标识符输出</h3>
+<p>LLM 只产出内容（标题/正文/标签），一切 <strong>hubId 归属由代码计算</strong>：distill 过滤编造 hubId（只认输入集合内的）、compact 的 hubIds 并集由代码按 sourceSlugs 映射计算、eval 探针 slug 必须来自输入。这条红线保证了对账体系不被幻觉污染。</p>
+<h3>ADR-5：保守默认 + 显式放行的风险分级</h3>
+<ul>
+  <li>写回按风险分批：batch1（claude/codex）自动 → batch2（qoder）自动 → batch3（qoderwork/wukong）默认禁用，<code>batch3Enabled</code> 显式开启；悟空因云端同步覆盖风险配置 <code>readOnly</code> 永不写回；</li>
+  <li>删除传播（tombstone）默认 <code>autoPropagate=false</code>：删除只登记证据链，<code>hub tombstone apply</code> 人工确认后才传播，并有风暴熔断（10 分钟 20 条阈值）防误删级联。</li>
+</ul>
+
+<h2>5. 可靠性工程：在别人的地盘写字</h2>
+<p>Memory Hub 最大的工程难点：<strong>写回目标目录不归自己管</strong>——App 客户端会重组目录、重写文件、云端同步覆盖。以下机制全部来自实战教训：</p>
+<h3>5.1 写入安全（safe-write.js）</h3>
+<pre><code>备份（分池限额+1h 保护窗口）→ registerInflight → 原子写（tmp+rename）→ verify → 失败按 manifest 回滚</code></pre>
+<h3>5.2 回环与回声的双层防御</h3>
+<p>这是系统最深刻的教训。写回的内容会触发文件事件，被自己重新采集：</p>
+<ul>
+  <li><strong>第一层 inflight（路径+hash）</strong>：写回前登记，watcher 命中即丢弃事件。<strong>盲区</strong>：App 重组目录（路径变了）或向同一文件追加（hash 变了）即绕过；</li>
+  <li><strong>第二层回声护栏（内容指纹）</strong>：<code>isEchoEntry</code> 按三类指纹拦截（正文 <code>[hub-…]</code> 渲染标记 / chatId <code>hub-</code> 前缀 / <code>source: memory-hub</code>）。实测该盲区曾造成"写回→采集→蒸馏→再写回"的回声循环，单日膨胀 1.3 万条快照、吹出 895 个重复 wiki 页。</li>
+</ul>
+<div class="callout warn"><strong>设计原则：凡是自己写出去的东西，必须能在任何变形后仍被认出来。</strong> 渲染标记（hubId 水印）同时服务于幂等、校验、删除传播和回声识别，一个机制四处受益。</div>
+<h3>5.3 校验与回滚的粒度演进</h3>
+<ul>
+  <li>M8：写后 <code>verify()</code> 纳入生产管线，失败整批回滚；</li>
+  <li>N2：校验口径与写入口径统一（qoder 跨 category 定位——Qoder 客户端会挪文件，只查预期目录必然误判）；</li>
+  <li>N3：<strong>条目级回滚</strong>——verify 返回 <code>failedIds</code>，只回滚失败条目标 deferred 下轮重试，不连累整批（此前单条失败 → 整批回滚 → 935 页 pending 死循环）。</li>
+</ul>
+<h3>5.4 失败隔离与自愈</h3>
+<table>
+  <tr><th>机制</th><th>防什么</th></tr>
+  <tr><td>毒批/毒簇隔离（失败 ≥3 次不再重放）</td><td>一条坏数据反复烧 token</td></tr>
+  <tr><td>frontmatter 损坏 → <code>_quarantine</code> 物理隔离</td><td>单文件损坏阻塞全局扫描</td></tr>
+  <tr><td>TooLarge 对半拆分、429/5xx 指数退避</td><td>网关限制导致整轮失败</td></tr>
+  <tr><td>跨进程文件锁（心跳 20s、3 分钟判陈旧）</td><td>daemon 与 CLI 并发互吞</td></tr>
+  <tr><td>每日写入配额（qoderwork 100 块/天）</td><td>首次全量把目标 App 灌爆</td></tr>
+  <tr><td>crash 计数 ≥5 主动 bootout</td><td>launchd KeepAlive 崩溃重启风暴</td></tr>
+</table>
+<h3>5.5 密钥纪律</h3>
+<p>明文密钥只存 macOS Keychain；配置只存引用名（<code>keyRef</code>）；日志/错误信息绝不回显 Authorization；蒸馏落盘前 <code>maskSecrets</code> 强制打码。仓库全历史扫描 0 密钥（L3 深度扫描多轮 0 发现）。</p>
+
+<h2>6. 演进史：每个机制背后的事故</h2>
+<table>
+  <tr><th>事故</th><th>根因</th><th>沉淀的机制</th></tr>
+  <tr><td>qoder 写回死循环（pending 935 页永不清）</td><td>客户端周期性重组记忆目录 + 校验口径与写入不一致 + 整批回滚连坐</td><td>N2 跨 category 校验、N3 条目级回滚、备份保护窗口</td></tr>
+  <tr><td>claude 通道 YAML 崩溃</td><td>正文以孤立 <code>---</code> 开头，gray-matter 字符串传参误判 frontmatter</td><td>全部 <code>matter.stringify</code> 对象传参 <code>{ content }</code></td></tr>
+  <tr><td>同主题 wiki 页碎片化（ab-test 34 页）</td><td>LLM 起名随机性绕过词集相似度归并</td><td>compact 全局归并（主题键聚类 + LLM 重组 + noGain 隔离）</td></tr>
+  <tr><td>回声循环（单日 +1.3 万快照）</td><td>inflight 路径+hash 抑制被 App 重组/追加绕过</td><td>内容指纹回声护栏（采集层 + 蒸馏层双兜底）</td></tr>
+  <tr><td>qoderwork 隔天重灌</td><td>幂等只查当天 daily 文件</td><td>跨全部 daily 文件幂等 + 每日配额</td></tr>
+</table>
+<div class="callout"><strong>方法论</strong>：每次事故 → 根因三层拆解 → 机制化修复 → 测试用例固化（194 → 219 个）→ 经验写回记忆系统本身。</div>
+
+<h2>7. 效果评测体系（hub eval）</h2>
+<p>"有没有用"拆成三层递进验证：</p>
+<ol>
+  <li><strong>管道有效性</strong>（零成本，日志汇总）：写回成功率 99.3%（最近 2000 条，failed 0）、wiki 从 3162 页收敛中；</li>
+  <li><strong>记忆可达性</strong>（确定性检测）：LLM 从 wiki 抽样出 20 道"只有记忆里才有答案"的事实探针题，判据关键词在各端记忆语料中的到达率——claude/codex/qoder 100%，qoderwork 90%（涓流回填中）；</li>
+  <li><strong>真实命中率</strong>（人工盲测）：各 App 新会话问探针题，有/无记忆对照，净命中率 = 记忆的真实贡献。已实测案例：QoderWork 能引用写回的 daily 文件精确回答。</li>
+</ol>
+<p>收益换算模型：<code>净命中率 × 事实类提问频次 × 单次免重复解释时间 + 口径踩坑规避 × 单次返工成本</code>，对照成本（LLM 免费额度内 ≈ 0 元 + 维护时间）。</p>
+
+<h2>8. 已知边界与未来方向</h2>
+<p><strong>边界（清醒认知）</strong>：</p>
+<ul>
+  <li>适配器是脆弱面：App 客户端升级改格式就要跟修（Qoder 重组行为已领教）；</li>
+  <li>检索是 grep 级：无语义检索、无知识图谱关系边（basic-memory 的强项）；</li>
+  <li>最终一致：分钟到小时级延迟，不适合会话内即时同步；</li>
+  <li>LLM 蒸馏理论上存在改写失真，靠 prompt 约束 + 冲突双方保留缓解，无法根除。</li>
+</ul>
+<p><strong>可能的下一步</strong>：</p>
+<ul>
+  <li>语义检索：FastEmbed 向量 + SQLite（成熟方案可借鉴）；</li>
+  <li>basic-memory 作为第六个适配器接入（它本质是"又一个 Markdown 记忆目录的 App"）；</li>
+  <li>eval 第三层半自动化：LLM judge 判分盲测结果；</li>
+  <li>wiki 页间关系边（wikilinks），让知识可遍历。</li>
+</ul>
+
+<h2>附：设计原则清单（供后续演进对照）</h2>
+<ol class="principles">
+  <li>零使用摩擦优先：用户和模型不改变任何习惯；</li>
+  <li>单向可重建链：sources（只增）→ wiki（权威）→ App 副本（可全量重建）；</li>
+  <li>自写内容必须可识别：hubId 水印贯穿一切写出物；</li>
+  <li>不信任 LLM 的标识符，只信任它的内容；</li>
+  <li>保守默认 + 显式放行：高风险操作永远需要人的一次确认；</li>
+  <li>每个故障都要变成机制 + 测试，而不是一次性修复；</li>
+  <li>一切写入可回滚，一切失败可重试，一切重试有上限。</li>
+</ol>
+
+<footer>Memory Hub · 架构设计思路报告 v1.0 · 2026-08-13 · 同源 Markdown 版见 docs/架构设计思路报告.md</footer>
+</div>
+</body>
+</html>
