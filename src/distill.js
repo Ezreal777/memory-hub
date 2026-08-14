@@ -57,6 +57,73 @@ function distillLogPath() {
   return path.join(paths.logs, 'distill.log');
 }
 
+// ---------------------------------------------------------------------------
+// LLM 限流冷却（供 distill / compact / eval 共用）
+// ---------------------------------------------------------------------------
+
+/** 冷却状态文件：state/llm-cooldown.json {"until":"<ISO>","reason":"..."} */
+export function llmCooldownPath() {
+  return path.join(storePaths.state, 'llm-cooldown.json');
+}
+
+/** 小时级限流的缺省冷却时长（60 分钟） */
+export const LLM_COOLDOWN_MS = 60 * 60 * 1000;
+
+/**
+ * 查询限流冷却剩余毫秒（未在冷却中返回 0）。
+ * 背景：idealab 免费 AK 的失败调用照样计入日额度（200 次/天），撞限流后
+ * 继续发请求等于白烧额度（实测一上午烧光 200 次），故撞墙一次即整轮刹车。
+ * @param {number} [nowMs]
+ * @returns {{ remainMs: number, until: string, reason: string }}
+ */
+export function llmCooldownRemaining(nowMs = Date.now()) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(llmCooldownPath(), 'utf8'));
+    const until = Date.parse(raw.until || '');
+    if (Number.isFinite(until) && until > nowMs) {
+      return { remainMs: until - nowMs, until: raw.until, reason: String(raw.reason || '') };
+    }
+  } catch {
+    // 无冷却记录
+  }
+  return { remainMs: 0, until: '', reason: '' };
+}
+
+/**
+ * 启动限流冷却：按错误文案定时长——日额度耗尽（“今天/请明天再来”）冷却到
+ * 本地次日凌晨；小时级限流冷却 60 分钟。幂等：已有更晚的冷却不回退。
+ * @param {string} errMessage 限流错误文案
+ * @param {number} [nowMs]
+ * @returns {string} 生效的冷却截止 ISO 时间
+ */
+export function startLlmCooldown(errMessage, nowMs = Date.now()) {
+  let untilMs;
+  if (/今天|请明天再来/.test(String(errMessage || ''))) {
+    const d = new Date(nowMs);
+    d.setHours(24, 0, 0, 0); // 本地次日凌晨（日额度重置点）
+    untilMs = d.getTime();
+  } else {
+    untilMs = nowMs + LLM_COOLDOWN_MS;
+  }
+  const existing = llmCooldownRemaining(nowMs);
+  if (existing.remainMs > 0 && Date.parse(existing.until) >= untilMs) {
+    return existing.until; // 已有更晚冷却，不回退
+  }
+  const until = new Date(untilMs).toISOString();
+  withLock(llmCooldownPath(), () => {
+    atomicWrite(
+      llmCooldownPath(),
+      `${JSON.stringify({ until, reason: String(errMessage || '').slice(0, 200) }, null, 2)}\n`,
+      { mode: FILE_MODE },
+    );
+  });
+  appendLogEntry(
+    distillLogPath(),
+    `${new Date(nowMs).toISOString()}\twarn\tLLM 限流，进入冷却至 ${until}（期间所有 LLM 环节零调用直接跳过，防白烧额度）`,
+  );
+  return until;
+}
+
 /**
  * 读取 distill 状态。除已处理 hubId 外，还包含：
  * - quarantined：frontmatter 不可解析被隔离的快照清单（H5）；
@@ -1225,6 +1292,17 @@ export async function distill(opts = {}) {
   // H3：批内物理去重与同名合并（重复者的 hubId 随代表所在页一并标 processed）
   const { kept, members } = dedupeSnapshots(snapshots);
 
+  // 限流冷却检查：冷却期内零调用直接跳过（失败调用照样计额度，撞墙无意义）
+  const cooldown = llmCooldownRemaining();
+  if (cooldown.remainMs > 0) {
+    return {
+      ok: false,
+      cooldown: true,
+      error: `LLM 限流冷却中（至 ${cooldown.until}，剩余 ${Math.ceil(cooldown.remainMs / 60000)} 分钟），本轮零调用跳过`,
+      retained: snapshots.length,
+    };
+  }
+
   // LLM 客户端：注入优先；否则按 config + Keychain 构建（失败即降级返回错误）
   let client;
   try {
@@ -1248,6 +1326,8 @@ export async function distill(opts = {}) {
 
   while (queue.length > 0) {
     if (pagesAllowance <= 0) break;
+    // 限流冷却生效即刻刹车（含同轮内 rewritePageWithLlm 撞限流的情况）
+    if (llmCooldownRemaining().remainMs > 0) break;
     const batch = queue.shift();
     const sig = batchSignature(batch);
 
@@ -1277,6 +1357,12 @@ export async function distill(opts = {}) {
         );
         queue.unshift(...splitBatch(batch));
         continue;
+      }
+      // 限流：整轮刹车进入冷却（剩余批次不再尝试——失败调用照样计额度）
+      if (err?.rateLimited) {
+        const until = startLlmCooldown(err.message);
+        batchErrors.push(`LLM 限流，整轮刹车冷却至 ${until}（剩余 ${queue.length + 1} 批下轮继续）: ${err.message}`);
+        break;
       }
       batchErrors.push(`LLM 调用失败（该批 ${batch.length} 条跳过，下轮重试）: ${err.message}`);
       continue;
@@ -1382,6 +1468,8 @@ export async function distill(opts = {}) {
           try {
             ({ fm, body } = await rewritePageWithLlm(client, oldContent, p, now));
           } catch (err) {
+            // 限流：触发冷却（下一批次开头刹车），本页回退确定性追加合并
+            if (err?.rateLimited) startLlmCooldown(err.message);
             appendLogEntry(
               distillLogPath(),
               `${now}\twarn\t超长页整页重写失败，回退追加合并: ${slug}.md (${err.message})`,

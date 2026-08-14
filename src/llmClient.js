@@ -16,7 +16,7 @@
 export class LlmError extends Error {
   /**
    * @param {string} message 错误信息（绝不含密钥）
-   * @param {{ status?: number|null, retryable?: boolean, tooLarge?: boolean }} [meta]
+   * @param {{ status?: number|null, retryable?: boolean, tooLarge?: boolean, rateLimited?: boolean }} [meta]
    */
   constructor(message, meta = {}) {
     super(message);
@@ -27,6 +27,8 @@ export class LlmError extends Error {
     this.retryable = Boolean(meta.retryable);
     /** 请求体超网关上限（上层应拆分批次而非重试） */
     this.tooLarge = Boolean(meta.tooLarge);
+    /** 配额/频次限流（上层应整轮刹车进入冷却，继续发请求只会白烧额度） */
+    this.rateLimited = Boolean(meta.rateLimited);
   }
 }
 
@@ -120,8 +122,12 @@ export function createLlmClient(opts = {}) {
       const status = Number(resp.status);
       // M5：请求体超网关上限（413 或响应体含 TooLarge）→ 上层拆分批次，重试无意义
       const tooLarge = status === 413 || /TooLarge|too\s*large/i.test(snippet);
-      const retryable = !tooLarge && (status === 429 || status >= 500);
-      throw new LlmError(`LLM 返回 HTTP ${status}: ${snippet}`, { status, retryable, tooLarge });
+      // 配额/频次限流：标准 429，或 idealab 网关的 400+IRC-001（小时限流/日额度耗尽）。
+      // 关键事实：失败调用照样计入日额度，因此不重试、上层整轮刹车进入冷却
+      const rateLimited =
+        status === 429 || (status === 400 && /IRC-001|超过了\s*\d+\s*次|请下一个周期|请明天再来/.test(snippet));
+      const retryable = !tooLarge && !rateLimited && status >= 500;
+      throw new LlmError(`LLM 返回 HTTP ${status}: ${snippet}`, { status, retryable, tooLarge, rateLimited });
     }
 
     let data;

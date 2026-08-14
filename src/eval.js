@@ -24,7 +24,7 @@ import { storePaths, ensureHubStore } from './hub-store.js';
 import { loadConfig } from './config.js';
 import { withLock } from './util/lock.js';
 import { listCompactablePages } from './compact.js';
-import { buildRealClient, extractJson, maskSecrets } from './distill.js';
+import { buildRealClient, extractJson, maskSecrets, llmCooldownRemaining, startLlmCooldown } from './distill.js';
 import { loadWritebackLog } from './writeback.js';
 
 /** 探针集文件：state/eval-probes.json */
@@ -131,6 +131,11 @@ export async function generateProbes(opts = {}) {
   if (pages.length === 0) {
     return { ok: false, error: 'wiki 中没有可出题的页面（先运行 hub distill）' };
   }
+  // 限流冷却检查：冷却期内零调用直接跳过（失败调用照样计额度）
+  const cooldown = llmCooldownRemaining();
+  if (cooldown.remainMs > 0) {
+    return { ok: false, error: `LLM 限流冷却中（至 ${cooldown.until}），稍后再试` };
+  }
   let client;
   try {
     client = opts.client || buildRealClient(config);
@@ -153,6 +158,7 @@ export async function generateProbes(opts = {}) {
       { maxTokens: 8192 },
     );
   } catch (err) {
+    if (err?.rateLimited) startLlmCooldown(err.message);
     return { ok: false, error: `LLM 出题失败: ${err.message}`, llmCalls: 1 };
   }
   let probes;

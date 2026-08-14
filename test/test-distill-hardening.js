@@ -376,7 +376,7 @@ test('M2：解析失败达 3 次的批次记入隔离清单并告警一次，之
 // M3：llmClient 重试 + distill 单批失败 continue
 // ---------------------------------------------------------------------------
 
-test('M3a：llmClient 对 5xx/429/网络错误指数退避重试，4xx 不重试，TooLarge 带标记', async () => {
+test('M3a：llmClient 对 5xx/网络错误指数退避重试，429 判限流不重试，4xx 不重试，TooLarge 带标记', async () => {
   const base = { baseUrl: 'http://mock.local/v1', model: 'm', apiKey: 'k', retryDelaysMs: [1, 1] };
 
   // 5xx 两次后成功 → 共 3 次
@@ -392,7 +392,7 @@ test('M3a：llmClient 对 5xx/429/网络错误指数退避重试，4xx 不重试
   assert.equal(await c500.chat([]), '成功');
   assert.equal(n500, 3);
 
-  // 429 一直失败 → 重试耗尽共 3 次
+  // 429 限流：绝不重试（失败调用照样计额度，上层整轮刹车进入冷却）
   let n429 = 0;
   const c429 = createLlmClient({
     ...base,
@@ -401,8 +401,8 @@ test('M3a：llmClient 对 5xx/429/网络错误指数退避重试，4xx 不重试
       return { ok: false, status: 429, text: async () => 'rate limited' };
     },
   });
-  await assert.rejects(() => c429.chat([]), /HTTP 429/);
-  assert.equal(n429, 3);
+  await assert.rejects(() => c429.chat([]), (err) => /HTTP 429/.test(err.message) && err.rateLimited === true);
+  assert.equal(n429, 1);
 
   // 网络错误可重试
   let nNet = 0;

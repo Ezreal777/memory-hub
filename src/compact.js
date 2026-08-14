@@ -44,6 +44,8 @@ import {
   trimTrailingOrphanHeadings,
   appendPendingWriteback,
   pendingWritebackPath,
+  llmCooldownRemaining,
+  startLlmCooldown,
   CATEGORY_ENUM,
   DEFAULT_CATEGORY,
 } from './distill.js';
@@ -454,6 +456,16 @@ export async function compact(opts = {}) {
   }
 
   const state = loadCompactState();
+  // 限流冷却检查：冷却期内零调用直接跳过（失败调用照样计额度）
+  const cooldown = llmCooldownRemaining();
+  if (cooldown.remainMs > 0) {
+    return {
+      ok: false,
+      cooldown: true,
+      error: `LLM 限流冷却中（至 ${cooldown.until}，剩余 ${Math.ceil(cooldown.remainMs / 60000)} 分钟），本轮零调用跳过`,
+      clusters: clusters.length,
+    };
+  }
   let client;
   try {
     client = opts.client || buildRealClient(config);
@@ -469,9 +481,10 @@ export async function compact(opts = {}) {
   const errors = [];
   let llmCalls = 0;
   let clustersDone = 0;
+  let rateLimitBrake = false; // 限流刹车标记：命中后不再处理任何后续簇
 
   for (const cluster of clusters) {
-    if (clustersDone >= maxClusters) break;
+    if (clustersDone >= maxClusters || rateLimitBrake) break;
     let didWork = false;
     // 大簇分块：每块 ≤ maxPagesPerCall 页；本轮每簇只推进这些块，跨轮收敛
     for (let i = 0; i < cluster.pages.length; i += maxPagesPerCall) {
@@ -485,6 +498,13 @@ export async function compact(opts = {}) {
         llmCalls += 1;
         llmText = await client.chat(buildCompactMessages(chunk), { maxTokens: 8192 });
       } catch (err) {
+        // 限流：整轮刹车进入冷却（后续块/簇不再尝试——失败调用照样计额度）
+        if (err?.rateLimited) {
+          const until = startLlmCooldown(err.message);
+          errors.push(`[${cluster.key}] LLM 限流，整轮刹车冷却至 ${until}: ${err.message}`);
+          rateLimitBrake = true;
+          break;
+        }
         errors.push(`[${cluster.key}] LLM 调用失败（该块 ${chunk.length} 页跳过，下轮重试）: ${err.message}`);
         continue;
       }
