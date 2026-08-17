@@ -157,7 +157,7 @@ test('H3a：内容 hash 物理去重——逐字相同的快照只送一份进 L
 
   // H7 顺带验证：e2e 主索引行回填了 hub-id
   const index = fs.readFileSync(storePaths.masterIndex, 'utf8');
-  assert.match(index, /共 1 个页面/);
+  assert.match(index, /## 主题页（1 页）/);
   assert.ok(index.includes('hub-id: '), '索引行含 hub-id 字段');
   assert.ok(index.includes('hub-dupb2'), 'hub-id 从页面 frontmatter 回填');
 
@@ -563,7 +563,7 @@ test('H7：rebuildMasterIndex 收录全部页面（含子目录）、计数用�
 
   const p = rebuildMasterIndex();
   const index = fs.readFileSync(p, 'utf8');
-  assert.match(index, /共 3 个页面/, '头部计数用实际值');
+  assert.match(index, /## 主题页（3 页）/, '头部计数用实际值');
   assert.match(index, /\[Alpha 主题\]\(alpha-topic\.md\).*hub-id: hub-a1, hub-a2/, 'hub-id 回填');
   assert.match(index, /\[Beta 主题\]\(beta\.md\).*hub-id: 无/, '无 frontmatter 页面 hub-id 记「无」');
   assert.match(index, /\[Gamma 主题\]\(nested\/gamma\.md\).*hub-id: hub-g1/, '子目录页面不漏收');

@@ -28,6 +28,8 @@ import { Watcher } from './watcher.js';
 import { distill } from './distill.js';
 import { runWriteback, wikiToEntries } from './writeback.js';
 import { compact, compactDue } from './compact.js';
+import { promoteScan, promoteScanDue } from './promote.js';
+import { primeApiKeyCache } from './keys.js';
 import { appendLogEntry, rotateLogFile } from './util/log.js';
 
 /** launchd 服务标签 */
@@ -93,6 +95,16 @@ export function tailLines(file, n = 10) {
 /** daemon pid 文件路径：state/daemon.pid */
 export function daemonPidPath() {
   return path.join(paths.state, 'daemon.pid');
+}
+
+/**
+ * daemon 健康档案路径：state/daemon-health.json。
+ * 背景：daemon 常驻进程的运行时故障（如 watcher 万级 fd 致 spawn EBADF 读不到
+ * Keychain）在 CLI 上下文无法复现，外部只能翻日志猜；此档案由 daemon 自证：
+ * 预热结果 + 每轮 pipeline 各环节结果 + 最近一次 LLM 成功时间，供 doctor 检查。
+ */
+export function daemonHealthPath() {
+  return path.join(paths.state, 'daemon-health.json');
 }
 
 /**
@@ -231,6 +243,13 @@ export function buildPlist(opts = {}) {
     `  <string>${xmlEscape(out)}</string>`,
     '  <key>StandardErrorPath</key>',
     `  <string>${xmlEscape(err)}</string>`,
+    // chokidar 4（无 fsevents）在 macOS 上每监听文件占一个 kqueue fd，万级文件目录
+    // 会顶满 launchd 缺省 fd 上限（256/10240）导致 spawnSync EBADF（读 Keychain 失败）
+    '  <key>SoftResourceLimits</key>',
+    '  <dict>',
+    '    <key>NumberOfFiles</key>',
+    '    <integer>65536</integer>',
+    '  </dict>',
     '  <key>EnvironmentVariables</key>',
     '  <dict>',
     '    <key>HOME</key>',
@@ -585,6 +604,9 @@ export async function runDaemon(opts = {}) {
   const writebackFn = opts.writebackFn || runWriteback;
   const compactFn = opts.compactFn || compact;
   const compactDueFn = opts.compactDueFn || compactDue;
+  // 晋升提名调度（同 compact 模式：可注入，兜底轮到期触发）
+  const promoteScanFn = opts.promoteScanFn || promoteScan;
+  const promoteScanDueFn = opts.promoteScanDueFn || promoteScanDue;
 
   logDaemon(
     'info',
@@ -592,6 +614,25 @@ export async function runDaemon(opts = {}) {
   );
 
   let stopping = false;
+
+  // 健康档案：daemon 运行时自证（预热/每轮环节结果/最近 LLM 成功时间），
+  // 写失败只降级不影响主流程；doctor 据此判断「存活但 LLM 从未成功」类故障
+  const health = {
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    prime: null,
+    lastRound: null,
+    lastLlmSuccessAt: null,
+    updatedAt: null,
+  };
+  const saveHealth = () => {
+    try {
+      health.updatedAt = new Date().toISOString();
+      atomicWrite(daemonHealthPath(), `${JSON.stringify(health, null, 2)}\n`);
+    } catch (err) {
+      logDaemon('warn', `健康档案写入失败（不影响主流程）: ${err.message}`);
+    }
+  };
 
   // 2. 事件驱动调度：变更累计窗口 + 静默合并 + 最长推迟兜底。
   // 低于阈值的零星变更不单独触发（留给兜底扫描），避免频繁 LLM 调用烧 token。
@@ -648,14 +689,20 @@ export async function runDaemon(opts = {}) {
     acc.bytes = 0;
     const isSweep = reason !== '阈值触发' && reason !== '阈值触发-最长推迟到期';
     let hasBacklog = false; // 本轮受 maxBatches 限额未处理完的积压批次
+    // 本轮健康记录：各环节 ok/error 落档，finally 统一写入健康档案
+    const round = { reason, at: new Date().toISOString(), distill: null, compact: null, promote: null, writeback: null, error: null };
     try {
       let distilledNew = false;
       const r = await distillFn({ config });
       if (!r.ok) {
+        round.distill = { ok: false, error: r.error };
         logDaemon('warn', `[${reason}] distill 降级跳过（sources 保留，下轮再试）: ${r.error}`);
       } else if (r.pending > 0) {
         distilledNew = (r.written?.length ?? 0) > 0;
         hasBacklog = Number.isFinite(r.totalBatches) && r.totalBatches > (r.batches ?? 0);
+        round.distill = { ok: true, pending: r.pending, written: r.written?.length ?? 0, batches: r.batches ?? 0 };
+        // 有真实产出即视为 LLM 通路验证成功（pending=0 轮次不发起调用，不计）
+        if (distilledNew) health.lastLlmSuccessAt = new Date().toISOString();
         logDaemon(
           'info',
           `[${reason}] distill 完成: ${r.pending} 条快照（窗口累计 ${window.count} 条/${window.bytes} 字节）→ ${r.written?.length ?? 0} 个页面${hasBacklog ? `，尚余 ${r.totalBatches - r.batches} 批积压，稍后续跑` : ''}`,
@@ -670,16 +717,41 @@ export async function runDaemon(opts = {}) {
         try {
           const c = await compactFn({ config });
           if (!c.ok) {
+            round.compact = { ok: false, error: c.error };
             logDaemon('warn', `[${reason}] compact 降级跳过（下轮重试）: ${c.error}`);
           } else if ((c.merged?.length ?? 0) > 0) {
             compacted = true;
+            round.compact = { ok: true, merged: c.merged.length, llmCalls: c.llmCalls ?? 0 };
+            if ((c.llmCalls ?? 0) > 0) health.lastLlmSuccessAt = new Date().toISOString();
             logDaemon(
               'info',
               `[${reason}] compact 完成: ${c.clustersDone}/${c.clusters} 簇（LLM 调用 ${c.llmCalls} 次）→ 归并出 ${c.merged.length} 页、删除 ${c.removedPages.length} 页${c.error ? `（部分块失败: ${c.error}）` : ''}`,
             );
           }
         } catch (err) {
+          round.compact = { ok: false, error: err.message };
           logDaemon('warn', `[${reason}] compact 异常（跳过，下轮重试）: ${err.message}`);
+        }
+      }
+
+      // 晋升提名（promote scan）：只在兜底/追赶轮且到期（缺省每周）时触发；
+      // 只产出提名清单供用户 hub promote list/apply 确认，不自动写 core 页
+      if (isSweep && promoteScanDueFn(config)) {
+        try {
+          const p = await promoteScanFn({ config });
+          if (!p.ok) {
+            round.promote = { ok: false, error: p.error };
+            logDaemon('warn', `[${reason}] promote scan 跳过: ${p.error}`);
+          } else if (p.nominated > 0) {
+            round.promote = { ok: true, nominated: p.nominated, llm: p.llm };
+            logDaemon(
+              'info',
+              `[${reason}] promote scan 完成: 扫描 ${p.scanned} 页→提名 ${p.nominated} 条（LLM: ${p.llm}），运行 hub promote list 确认`,
+            );
+          }
+        } catch (err) {
+          round.promote = { ok: false, error: err.message };
+          logDaemon('warn', `[${reason}] promote scan 异常（跳过，下轮重试）: ${err.message}`);
         }
       }
 
@@ -688,6 +760,7 @@ export async function runDaemon(opts = {}) {
         if (entries.length > 0) {
           const w = await writebackFn({ config }); // 绝不传 forceBatch3，遵守 batch3Enabled 门禁
           const summary = (w.appResults || []).map((a) => `${a.app}:${a.status}`).join(', ');
+          round.writeback = { ok: !(w.appResults || []).some((a) => a.status === 'failed'), apps: summary };
           const noteworthy = (w.appResults || []).some((a) => a.status === 'written' || a.status === 'failed');
           // 兜底轮全为幂等跳过时不刷日志，避免每小时一条噪音
           if (noteworthy || distilledNew || compacted) {
@@ -696,8 +769,11 @@ export async function runDaemon(opts = {}) {
         }
       }
     } catch (err) {
+      round.error = err.message;
       logDaemon('error', `[${reason}] pipeline 异常: ${err.message}`);
     } finally {
+      health.lastRound = round;
+      saveHealth();
       pipelineBusy = false;
       if (pipelineRerun || (hasBacklog && !stopping)) {
         // 积压未清（如停机欠账首次追赶）或运行期间又有触发：稍作喘息后续跑，
@@ -709,7 +785,20 @@ export async function runDaemon(opts = {}) {
     }
   }
 
-  // 3. 启动 watcher（信号由 daemon 统一接管；onIngest 喂入变更累计窗口）
+  // 3. 启动 watcher 前预热 API Key：watcher（chokidar 4 kqueue）持有万级常开 fd 后，
+  // macOS 26 的 posix_spawn 必现 EBADF，常驻期间无法再调 security 读 Keychain；
+  // 此刻 spawn 仍可用，先把密钥预热进内存（失败只降级告警，LLM 环节照旧跳过重试）
+  try {
+    const primed = primeApiKeyCache();
+    health.prime = { ok: true, primed, at: new Date().toISOString() };
+    logDaemon('info', primed ? 'API Key 已预热到进程内存（watcher 启动后 Keychain 不可用，走缓存）' : 'llm.keyRef 未配置，跳过 API Key 预热');
+  } catch (err) {
+    health.prime = { ok: false, error: err.message, at: new Date().toISOString() };
+    logDaemon('warn', `API Key 预热失败（LLM 环节将降级跳过）: ${err.message}`);
+  }
+  saveHealth();
+
+  // 3.1 启动 watcher（信号由 daemon 统一接管；onIngest 喂入变更累计窗口）
   const watcher = new Watcher(config, { onIngest });
   watcher.start({ signals: false });
   const watchPaths = watcher.allWatchPaths();

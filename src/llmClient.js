@@ -12,6 +12,8 @@
  * - 任何错误信息与日志绝不包含明文密钥（Authorization 头不落日志、不回显）。
  */
 
+import { llmBudgetState, recordLlmCall } from './llm-usage.js';
+
 /** LLM 配置/调用类错误（区别于解析错误），供上层统一降级处理 */
 export class LlmError extends Error {
   /**
@@ -56,12 +58,15 @@ function sleep(ms) {
  *   fetchImpl?: Function,       // 可注入的 fetch（测试 mock 用），缺省全局 fetch
  *   timeoutMs?: number,         // 单次请求超时，缺省 120s
  *   retryDelaysMs?: number[],   // 重试退避序列（测试可注入 [1,1] 加速），缺省 LLM_RETRY_DELAYS_MS
+ *   budgetEnabled?: boolean,    // 预算台账开关；缺省仅真实 fetch 时启用（mock 注入不记账，防测试污染真实台账）
  * }} opts
  * @returns {{ chat: (messages: Object[], extra?: Object) => Promise<string>, baseUrl: string, model: string }}
  */
 export function createLlmClient(opts = {}) {
   const { baseUrl, model, apiKey, fetchImpl, timeoutMs = 120000 } = opts;
   const retryDelaysMs = Array.isArray(opts.retryDelaysMs) ? opts.retryDelaysMs : LLM_RETRY_DELAYS_MS;
+  // 预算台账：缺省仅真实 fetch 时启用（mock 注入不消耗额度，记账反而污染真实台账）
+  const budgetEnabled = opts.budgetEnabled ?? !fetchImpl;
   if (!baseUrl) {
     throw new LlmError(`llm.baseUrl 未配置，无法调用 LLM。${LLM_CONFIG_HINT}`);
   }
@@ -85,6 +90,17 @@ export function createLlmClient(opts = {}) {
    * @throws {LlmError} 网络/HTTP/响应结构异常时抛出（错误文本不含密钥）
    */
   async function chatOnce(messages, extra = {}) {
+    // 预算刹车（缺省关闭，config.llm.hourlyCallCap/dailyCallCap 启用）：主动限频
+    // 给同一 AK 的交互使用留余量；超额抛 rateLimited，调用方走既有冷却刹车
+    //（reason 含「请明天再来」时冷却到次日凌晨，否则 60 分钟）。
+    // 仅真实网关调用记账：注入 fetchImpl（测试 mock）不消耗额度，记账会污染真实台账
+    if (budgetEnabled) {
+      const budget = llmBudgetState();
+      if (budget.exceeded) {
+        throw new LlmError(`LLM 预算刹车: ${budget.reason}`, { rateLimited: true });
+      }
+      recordLlmCall(); // 每次真实发请求前登记（含重试的每次尝试——网关同样计数）
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let resp;

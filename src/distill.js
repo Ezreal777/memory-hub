@@ -930,7 +930,7 @@ export async function rewritePageWithLlm(client, oldContent, p, now) {
       }),
     },
   ];
-  const text = await client.chat(messages, { maxTokens: 8192 });
+  const text = await client.chat(messages, { maxTokens: 16384 });
   const json = extractJson(text);
   const title = maskSecrets(String(json?.title || p.title).trim()) || p.title;
   const content = maskSecrets(String(json?.content || '').trim());
@@ -1347,8 +1347,9 @@ export async function distill(opts = {}) {
     // M3：调用失败只跳过该批（continue），不中断整轮；TooLarge 对半拆分重试
     let llmText;
     try {
-      // 显式给足输出配额：网关缺省 max_tokens 偏小，归并页 JSON 容易被截断
-      llmText = await client.chat(messages, { maxTokens: 8192 });
+      // 显式给足输出配额：网关缺省 max_tokens 偏小，归并页 JSON 容易被截断；
+      // 推理模型（如 bailian/glm-5.2）的思考链也占配额，需 16384 兜底
+      llmText = await client.chat(messages, { maxTokens: 16384 });
     } catch (err) {
       if (err?.tooLarge && batch.length > 1) {
         appendLogEntry(

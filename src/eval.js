@@ -155,7 +155,7 @@ export async function generateProbes(opts = {}) {
         { role: 'system', content: PROBE_SYSTEM_PROMPT },
         { role: 'user', content: JSON.stringify(items) },
       ],
-      { maxTokens: 8192 },
+      { maxTokens: 16384 },
     );
   } catch (err) {
     if (err?.rateLimited) startLlmCooldown(err.message);

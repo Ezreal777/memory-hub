@@ -496,7 +496,7 @@ export async function compact(opts = {}) {
       let llmText;
       try {
         llmCalls += 1;
-        llmText = await client.chat(buildCompactMessages(chunk), { maxTokens: 8192 });
+        llmText = await client.chat(buildCompactMessages(chunk), { maxTokens: 16384 });
       } catch (err) {
         // 限流：整轮刹车进入冷却（后续块/簇不再尝试——失败调用照样计额度）
         if (err?.rateLimited) {

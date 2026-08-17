@@ -320,7 +320,7 @@ test('config.json 首次生成：5 个默认 app、权限 600、目录权限 700
   // L6：hubRoot 死配置已移除（数据根目录一律用 MEMORY_HUB_ROOT 环境变量指定）
   assert.equal(config.hubRoot, undefined);
   assert.equal(config.writeback.batch3Enabled, false, '高风险批次默认关闭');
-  assert.deepEqual(config.llm, { baseUrl: '', model: '', keyRef: '' });
+  assert.deepEqual(config.llm, { baseUrl: '', model: '', keyRef: '', hourlyCallCap: 0, dailyCallCap: 0 });
 
   // 权限
   assert.equal(fs.statSync(paths.config).mode & 0o777, 0o600, 'config.json 权限应为 600');

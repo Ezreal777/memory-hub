@@ -117,12 +117,12 @@ test('doctor：空环境全绿且零写入（纯只读承诺）', () => {
   const report = runDoctor();
   assert.equal(report.ok, true);
   assert.equal(report.counts.fail, 0);
-  assert.equal(report.checks.length, 9);
+  assert.equal(report.checks.length, 10);
   // 纯只读：runDoctor 之后隔离根目录仍然空空如也（不建目录、不写任何文件）
   assert.deepEqual(fs.readdirSync(root), []);
   const text = formatDoctorReport(report);
   assert.match(text, /健康度报告/);
-  assert.match(text, /结论: ✅ 9 项正常 \/ ⚠️ 0 项告警 \/ ❌ 0 项异常/);
+  assert.match(text, /结论: ✅ 10 项正常 \/ ⚠️ 0 项告警 \/ ❌ 0 项异常/);
 });
 
 test('doctor 索引完整率：缺页 ❌（列缺失示例）、陈旧行与 hub-id 未回填 ⚠️', () => {
@@ -459,7 +459,7 @@ test('CLI hub index：改调 rebuildMasterIndex（全量收录 + hub-id 回填�
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /已生成主索引/);
   const index = fs.readFileSync(storePaths.masterIndex, 'utf8');
-  assert.match(index, /共 1 个页面/);
+  assert.match(index, /## 主题页（1 页）/);
   assert.match(index, /\[索引页\]\(idx-page\.md\)/);
   assert.match(index, /hub-id: hub-idx-1/); // 旧 generateMasterIndex 此处恒为空
 });
@@ -471,10 +471,10 @@ test('CLI hub doctor --json：结构化输出；有 ❌ 时退出码非零', () 
   assert.equal(r.status, 0, r.stderr);
   let report = JSON.parse(r.stdout);
   assert.equal(report.ok, true);
-  assert.equal(report.checks.length, 9);
+  assert.equal(report.checks.length, 10);
   assert.deepEqual(
     report.checks.map((c) => c.id),
-    ['index', 'duplicate-titles', 'quarantine', 'backlog', 'writeback', 'backups', 'locks', 'test-markers', 'tombstones'],
+    ['index', 'duplicate-titles', 'quarantine', 'backlog', 'writeback', 'backups', 'locks', 'test-markers', 'tombstones', 'daemon-health'],
   );
   // 注入测试污染页（同时造成索引缺页）→ 退出码非零
   writePage('bad', { title: '污染', hubIds: ['hub-bad'], body: 'HUB-TEST 残留' });

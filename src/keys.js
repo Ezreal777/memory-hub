@@ -149,15 +149,29 @@ function assertSecurityBin() {
 function runSecurity(args) {
   assertSecurityBin();
   try {
-    // M8：timeout 10s + SIGKILL 兜底（Keychain 弹窗/挂死时绝不永久阻塞 daemon）
-    return execFileSync(SECURITY_BIN, args, { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' });
+    // M8：timeout 10s + SIGKILL 兜底（Keychain 弹窗/挂死时绝不永久阻塞 daemon）；
+    // stdio 必须显式指定：缺省会 inherit 父进程 stderr，launchd 常驻进程的继承 fd
+    // 在 macOS 26 下会失效导致 spawnSync EBADF（表现为 daemon 侧“条目不存在”）
+    return execFileSync(SECURITY_BIN, args, {
+      encoding: 'utf8',
+      timeout: 10000,
+      killSignal: 'SIGKILL',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
   } catch (err) {
     const timedOut = err?.killed || err?.signal === 'SIGKILL';
-    throw new Error(
-      `security ${args[0]} 执行失败（${timedOut ? '超时 10s 被强杀' : `退出码 ${err.status ?? '异常'}`}），请检查 Keychain 访问权限`,
-    );
+    // err.status 为空表示 spawn 本身失败（非命令退出），透传 errno code 便于定位 launchd 环境问题
+    const detail = timedOut
+      ? '超时 10s 被强杀'
+      : err.status != null
+        ? `退出码 ${err.status}`
+        : `spawn 失败 code=${err.code ?? '?'} errno=${err.errno ?? '?'} msg=${String(err.message || '').slice(0, 120)}`;
+    throw new Error(`security ${args[0]} 执行失败（${detail}），请检查 Keychain 访问权限`);
   }
 }
+
+/** 最近一次 keychainExists 探测失败的底层错误（诊断用，区分真不存在 vs 调用失败） */
+let lastProbeError = null;
 
 /**
  * 探测 Keychain 中指定引用名是否存在（仅查元数据、不取值，避免触发授权弹窗）。
@@ -167,8 +181,10 @@ function runSecurity(args) {
 export function keychainExists(name) {
   try {
     runSecurity(['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', name]);
+    lastProbeError = null;
     return true;
-  } catch {
+  } catch (err) {
+    lastProbeError = err.message;
     return false;
   }
 }
@@ -332,8 +348,30 @@ export function useKey(name, opts = {}) {
 }
 
 /**
+ * daemon 内存预热缓存：{ name, secret }。
+ * macOS 26 下 watcher（chokidar 4 kqueue 模式）持有万级常开 fd 后，
+ * posix_spawn 必现 EBADF，daemon 常驻期间无法再调 security 读 Keychain；
+ * 因此在 watcher 启动前预热一次，后续 resolveApiKey 直接走内存（不落盘、不进环境变量）。
+ */
+let primedKey = null;
+
+/**
+ * 预热 API Key 到进程内存（仅供 daemon 启动早期、watcher 拉起之前调用）。
+ * @param {string} [name] 密钥引用名；缺省取 config.llm.keyRef
+ * @returns {boolean} 是否预热成功（未配置 keyRef 时返回 false 不报错）
+ * @throws {Error} Keychain 读取失败时抛出（调用方决定降级策略）
+ */
+export function primeApiKeyCache(name) {
+  const keyRef = name || loadConfig().llm.keyRef;
+  if (!keyRef) return false;
+  const secret = resolveApiKey(keyRef);
+  primedKey = { name: keyRef, secret };
+  return true;
+}
+
+/**
  * 供后续 distill 调用：解析出真正可用的 API Key 明文。
- * 读取顺序：显式传入 name → config.llm.keyRef → Keychain。
+ * 读取顺序：显式传入 name → config.llm.keyRef → 内存预热缓存 → Keychain。
  * @param {string} [name] 密钥引用名；缺省取 config.llm.keyRef
  * @returns {string} API Key 明文
  * @throws {Error} 未配置 keyRef 或 Keychain 读取失败时抛出明确错误
@@ -344,8 +382,16 @@ export function resolveApiKey(name) {
   if (!keyRef) {
     throw new Error('resolveApiKey 失败：未配置 llm.keyRef，请先运行 hub keys --sync 并用 hub keys use <name> 选择');
   }
+  // 预热缓存命中：不再 spawn security（daemon 常驻期间 spawn 不可用，见 primedKey 注释）
+  if (primedKey && primedKey.name === keyRef) return primedKey.secret;
   if (!keychainExists(keyRef)) {
-    throw new Error(`resolveApiKey 失败：Keychain 中不存在条目 "${keyRef}"（service=${KEYCHAIN_SERVICE}），请先运行 hub keys --sync`);
+    // 透传底层探测错误：launchd 上下文下“调用失败”会被误报为“不存在”，需区分定位
+    const probe = lastProbeError ? `；探测底层错误: ${lastProbeError}` : '';
+    // daemon 常驻期间切换了 keyRef：预热缓存失配且 spawn 不可用，正确出路是重启而非 keys --sync
+    const staleHint = primedKey && primedKey.name !== keyRef
+      ? `；daemon 预热缓存为 "${primedKey.name}"，切换 keyRef 后需 hub daemon stop → start 重启生效`
+      : '';
+    throw new Error(`resolveApiKey 失败：Keychain 中不存在条目 "${keyRef}"（service=${KEYCHAIN_SERVICE}），请先运行 hub keys --sync${probe}${staleHint}`);
   }
   try {
     const secret = keychainGet(keyRef);

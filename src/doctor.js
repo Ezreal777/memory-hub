@@ -43,6 +43,7 @@ import {
   writebackDiagLogPath,
 } from './writeback.js';
 import { MAX_BACKUPS, MAX_FULL_BACKUPS, BACKUP_POOLS, backupPoolDir } from './safe-write.js';
+import { daemonPidPath, daemonHealthPath } from './daemon.js';
 
 /** 各检查项的缺失/污染示例最多列出条数 */
 export const DOCTOR_EXAMPLE_LIMIT = 10;
@@ -61,6 +62,12 @@ export const PENDING_STALE_MS = 24 * 60 * 60 * 1000;
 
 /** tombstone 长期未闭环判定阈值（登记超过 7 天仍未 wiki 标记 + App 清理完成） */
 export const TOMBSTONE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** daemon 存活超此时长仍无任何 LLM 成功轮次 → 判定链路故障（冷却最长 1 小时，留足余量） */
+export const DAEMON_LLM_SILENCE_FAIL_MS = 2 * 60 * 60 * 1000;
+
+/** 最近一次 LLM 成功距今超此时长 → 告警（积压存在时 daemon 每小时都应有成功轮次） */
+export const DAEMON_LLM_STALE_WARN_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 只读读取配置：doctor 纯只读钢线，不能用 loadConfig()（首次会惰性建目录/写默认配置）；
@@ -574,6 +581,116 @@ export function checkTombstones() {
 // ---------------------------------------------------------------------------
 
 /**
+ * 检查 10：daemon LLM 健康（读 state/daemon-health.json，daemon 运行时自证）。
+ * 背景：daemon 常驻进程的运行时故障（如 watcher 万级 fd 致 spawn EBADF 读不到
+ * Keychain）在 CLI 上下文无法复现，曾潜伏 3 天只能靠翻日志发现；本检查把
+ * 「存活但 LLM 从未成功」收敛为硬性 ❌：
+ *   - daemon 从未启用（无 pid/档案痕迹）→ ✅；曾运行但当前未运行 → ⚠️；
+ *   - 运行中但无健康档案/档案 pid 不符 → ⚠️（旧版 daemon 或启动早期）；
+ *   - API Key 预热失败 → ❌（Keychain 通路断，LLM 环节全降级）；
+ *   - 存活超 2 小时从无 LLM 成功轮次（且已配置 keyRef）→ ❌；
+ *   - 最近成功距今超 24 小时 → ⚠️。
+ * @param {number} [now] 当前时间戳（测试可注入）
+ * @returns {Object} makeCheck 结果
+ */
+export function checkDaemonHealth(now = Date.now()) {
+  const name = 'daemon LLM 健康';
+  let pidRaw = null;
+  try {
+    pidRaw = fs.readFileSync(daemonPidPath(), 'utf8');
+  } catch {
+    // pid 文件不存在：可能从未启用或已正常停止
+  }
+  const pid = pidRaw ? parseInt(pidRaw.trim(), 10) : NaN;
+  if (!isPidAlive(pid)) {
+    // 从无任何运行痕迹（pid/健康档案都没有）：未启用属正常状态，不报警
+    if (pidRaw === null && !fs.existsSync(daemonHealthPath())) {
+      return makeCheck('daemon-health', name, 'ok', 'daemon 未启用（hub daemon install 可开启后台自动化）', [], {
+        running: false,
+        installed: false,
+      });
+    }
+    return makeCheck('daemon-health', name, 'warn', 'daemon 曾运行但当前未运行（LLM 自动化停摆）', [
+      '运行 hub daemon start 启动；若未安装先 hub daemon install',
+    ], { running: false });
+  }
+  let health = null;
+  try {
+    health = JSON.parse(fs.readFileSync(daemonHealthPath(), 'utf8'));
+  } catch {
+    // 档案不存在/损坏：下面统一报告警
+  }
+  if (!health || typeof health !== 'object' || health.pid !== pid) {
+    return makeCheck(
+      'daemon-health',
+      name,
+      'warn',
+      `daemon 运行中（pid ${pid}）但健康档案缺失或陈旧（旧版 daemon 或启动早期）`,
+      ['重启 daemon（hub daemon stop → start）后由新进程生成'],
+      { running: true, pid },
+    );
+  }
+  const config = readConfigReadonly();
+  const llmConfigured = Boolean(config.llm?.keyRef);
+  const roundDetails = [];
+  const lr = health.lastRound;
+  if (lr) {
+    for (const stage of ['distill', 'compact', 'promote', 'writeback']) {
+      if (lr[stage] && lr[stage].ok === false) roundDetails.push(`最近一轮 ${stage} 失败: ${lr[stage].error}`);
+    }
+    if (lr.error) roundDetails.push(`最近一轮 pipeline 异常: ${lr.error}`);
+  }
+  if (llmConfigured && health.prime && health.prime.ok === false) {
+    return makeCheck(
+      'daemon-health',
+      name,
+      'fail',
+      'API Key 预热失败：daemon 常驻期间读不到密钥，LLM 环节全降级',
+      [`预热错误: ${health.prime.error}`, '修复 Keychain 后 hub daemon stop → start 重启生效', ...roundDetails],
+      { running: true, pid, prime: health.prime },
+    );
+  }
+  const startedMs = Date.parse(health.startedAt || '');
+  const uptimeMs = Number.isFinite(startedMs) ? now - startedMs : 0;
+  const lastOkMs = Date.parse(health.lastLlmSuccessAt || '');
+  const fmtH = (ms) => (ms / 3600000).toFixed(1);
+  if (llmConfigured && uptimeMs > DAEMON_LLM_SILENCE_FAIL_MS && !Number.isFinite(lastOkMs)) {
+    return makeCheck(
+      'daemon-health',
+      name,
+      'fail',
+      `daemon 存活 ${fmtH(uptimeMs)} 小时但 LLM 从未成功（冷却最长 1 小时，超 2 小时静默即链路故障）`,
+      [...(roundDetails.length ? roundDetails : ['健康档案无任何环节错误记录，检查 daemon.log 确认轮次是否被冷却/无积压长期跳过'])],
+      { running: true, pid, uptimeMs, prime: health.prime },
+    );
+  }
+  if (llmConfigured && Number.isFinite(lastOkMs) && now - lastOkMs > DAEMON_LLM_STALE_WARN_MS) {
+    return makeCheck(
+      'daemon-health',
+      name,
+      'warn',
+      `最近一次 LLM 成功已是 ${fmtH(now - lastOkMs)} 小时前（积压存在时每小时都应有成功轮次）`,
+      roundDetails,
+      { running: true, pid, lastLlmSuccessAt: health.lastLlmSuccessAt },
+    );
+  }
+  const primeDesc = health.prime?.ok ? (health.prime.primed ? '预热成功' : '未配置 keyRef（跳过）') : '未记录';
+  const llmDesc = Number.isFinite(lastOkMs)
+    ? `最近 LLM 成功: ${health.lastLlmSuccessAt}`
+    : llmConfigured
+      ? `尚无 LLM 成功轮次（存活 ${fmtH(uptimeMs)} 小时，未超 2 小时阈值）`
+      : 'llm.keyRef 未配置（LLM 环节按配置关闭）';
+  return makeCheck(
+    'daemon-health',
+    name,
+    'ok',
+    `daemon 运行中（pid ${pid}），API Key ${primeDesc}，${llmDesc}`,
+    roundDetails,
+    { running: true, pid, lastLlmSuccessAt: health.lastLlmSuccessAt ?? null },
+  );
+}
+
+/**
  * 执行全部健康度检查（纯只读）。
  * @returns {{ generatedAt: string, root: string, hub: string,
  *   checks: Object[], counts: { ok: number, warn: number, fail: number }, ok: boolean }}
@@ -591,6 +708,7 @@ export function runDoctor() {
     checkLocks(),
     checkTestMarkers(),
     checkTombstones(),
+    checkDaemonHealth(),
   ];
   const counts = { ok: 0, warn: 0, fail: 0 };
   for (const c of checks) counts[c.level] += 1;

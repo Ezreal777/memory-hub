@@ -281,6 +281,9 @@ export function wikiToEntries() {
       file: page,
       title,
       body: stripFirstH1(parsed.content),
+      // 核心层标记（wiki/core/ 页 frontmatter tier: core）：写回引擎按此分级——
+      // 增量轮次无条件重申 core 条目（被 App 整理机制清掉即重建复活）
+      tier: fm.tier === 'core' ? 'core' : undefined,
       frontmatter: {
         category: fm.category,
         keywords: Array.isArray(fm.tags) ? fm.tags.map(String) : undefined,
@@ -479,6 +482,7 @@ async function runAppWriteback(adapter, entries, opts, config, removalIds = []) 
  *   fromSources?: boolean, // 数据源改用 sources 快照（透传测试）
  *   forceBatch3?: boolean, // 临时放行 batch:3 高风险批次
  *   full?: boolean,        // H4：强制全量广播（忽略 pending-writeback.json）
+ *   coreOnly?: boolean,    // 分级写回：仅写回 wiki/core/ 核心层条目（验证/手动复活用）
  *   forceTombstones?: boolean, // MUST-2：绕过 autoPropagate 开关与 suspectedStorm 过滤，强制执行删除传播（hub tombstone apply 用）
  *   removalsOnly?: boolean, // MUST-2：只做 tombstone 移除不写回任何条目（hub tombstone apply 用）
  *   lockTimeoutMs?: number, // SHOULD-6：全局写锁抢锁超时；缺省 120s（CLI 交互命令传 30s）
@@ -503,6 +507,15 @@ export async function runWriteback(opts = {}) {
   }
 
   let entries = opts.fromSources ? sourcesToEntries() : wikiToEntries();
+  // 分级写回：core 条目（wiki/core/ 页）在增量轮次无条件重申；--core-only 仅写核心层
+  const coreReassert = config.core?.enabled !== false && config.core?.reassertEveryRound !== false;
+  const coreEntries = opts.fromSources ? [] : entries.filter((e) => e.tier === 'core');
+  if (opts.coreOnly) {
+    entries = coreEntries;
+    if (entries.length === 0) {
+      return { ok: true, mode: 'core-only', entryCount: 0, appResults: [], message: 'wiki/core/ 中没有可写回的核心页（先运行 hub promote）' };
+    }
+  }
   if (opts.entry) {
     entries = entries.filter(
       (e) => (Array.isArray(e.hubIds) && e.hubIds.includes(opts.entry)) || e.hubId === opts.entry,
@@ -572,7 +585,7 @@ export async function runWriteback(opts = {}) {
   // 只写回其中列出的页面；文件不存在/为空时降级全量并记一条日志。
   // compact 联动：清单 removals 中的 hubId（被归并删除页的主 hubId）本轮顺带
   // 做 App 侧旧渲染文件清理（removeEntries 先于写回执行，赢家页随后重写）。
-  const incrementalEligible = !opts.full && !opts.fromSources && !opts.app && !opts.entry && !opts.removalsOnly;
+  const incrementalEligible = !opts.full && !opts.fromSources && !opts.app && !opts.entry && !opts.removalsOnly && !opts.coreOnly;
   let incremental = false;
   let pendingUpdatedAt; // MUST-1：记住本轮消费的清单版本，清空时比对防误清 distill 新增页面
   let compactRemovalIds = []; // compact 登记的 App 侧待清理 hubId（非 tombstone，不受 autoPropagate 门控）
@@ -591,6 +604,14 @@ export async function runWriteback(opts = {}) {
         if (wanted.has(path.relative(storePaths.wiki, e.file))) return true;
         return path.dirname(e.file) === storePaths.wiki && wanted.has(path.basename(e.file));
       });
+      // 分级写回：core 条目不依赖 pending 清单，每个增量轮次无条件附带重申——
+      // 未被清理时命中 N2 幂等 skipped（零成本），被 App 整理机制清掉则重建复活
+      if (coreReassert && coreEntries.length > 0) {
+        const present = new Set(entries.map((e) => e.file));
+        for (const ce of coreEntries) {
+          if (!present.has(ce.file)) entries.push(ce);
+        }
+      }
       if (entries.length === 0 && removalIds.length === 0 && compactRemovalIds.length === 0) {
         // 清单页面已全部不存在（被删除/重命名）：清空防死循环（updatedAt 不一致时保留新增页面）
         const cleared = opts.dryRun ? false : clearPendingWriteback(pendingUpdatedAt);
@@ -706,7 +727,7 @@ export async function runWriteback(opts = {}) {
 
   return {
     ok: appResults.some((r) => ['written', 'dry-run'].includes(r.status)),
-    mode: incremental ? 'incremental' : 'full',
+    mode: opts.coreOnly ? 'core-only' : incremental ? 'incremental' : 'full',
     entryCount: entries.length,
     appResults,
     logPath: opts.dryRun ? undefined : writebackLogPath(),

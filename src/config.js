@@ -48,7 +48,9 @@ export function defaultConfig() {
       project_slug: '',
       notes: '',
     })),
-    llm: { baseUrl: '', model: '', keyRef: '' },
+    // hourlyCallCap/dailyCallCap：hub 主动限频预算（0 = 不启用；见 llm-usage.js），
+    // 用于给同一 AK 的交互使用留额度余量（如网关 10 次/时、200 次/天的免费档）
+    llm: { baseUrl: '', model: '', keyRef: '', hourlyCallCap: 0, dailyCallCap: 0 },
     debounceMs: 2000,
     pollIntervalMs: 60000,
     writeback: { batch3Enabled: false },
@@ -71,6 +73,15 @@ export function defaultConfig() {
       minClusterSize: 3, // 主题簇 ≥ 该页数才归并
       maxClustersPerRun: 4, // 单轮最多处理的簇数（控制 LLM 调用量，剩余下轮继续）
       maxPagesPerCall: 8, // 单次 LLM 调用最多送入的页面数（大簇分块跨轮收敛）
+    },
+    // 用户维度长期核心层（wiki/core/，详见 core-store.js / promote.js）
+    core: {
+      enabled: true, // false 则写回不重申 core 条目、daemon 不调度 promote scan
+      maxEntries: 50, // 核心页总数上限（产品约束：防长期层膨胀成第二个 wiki）
+      survivalDays: 15, // 存活验证窗口（约 2 个 Qoder 清理半衰期）
+      reassertEveryRound: true, // 增量写回轮次无条件重申 core 条目（被清即复活）
+      minScore: 3, // 晋升提名最低信号分（四信号各 1 分）
+      scanIntervalMs: 7 * 24 * 60 * 60 * 1000, // promote scan 最小间隔（每周），daemon 兜底触发
     },
     // daemon 事件驱动调度阈值（详见 daemon.js：达阈值提前整理，否则等 1 小时兜底扫描）
     daemon: {
@@ -97,6 +108,7 @@ function mergeWithDefaults(raw) {
   merged.tombstone = { ...def.tombstone, ...(raw.tombstone || {}) };
   merged.distill = { ...def.distill, ...(raw.distill || {}) };
   merged.compact = { ...def.compact, ...(raw.compact || {}) };
+  merged.core = { ...def.core, ...(raw.core || {}) };
   merged.daemon = { ...def.daemon, ...(raw.daemon || {}) };
   // apps 逐条补齐字段，保证每个条目结构完整
   const apps = Array.isArray(raw.apps) && raw.apps.length > 0 ? raw.apps : def.apps;
@@ -178,6 +190,7 @@ export function updateConfig(patch = {}) {
     if (patch.tombstone) merged.tombstone = { ...config.tombstone, ...patch.tombstone };
     if (patch.distill) merged.distill = { ...config.distill, ...patch.distill };
     if (patch.compact) merged.compact = { ...config.compact, ...patch.compact };
+    if (patch.core) merged.core = { ...config.core, ...patch.core };
     if (patch.daemon) merged.daemon = { ...config.daemon, ...patch.daemon };
     saveConfig(merged);
     return merged;

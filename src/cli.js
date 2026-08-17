@@ -48,6 +48,15 @@ import { runDoctor, formatDoctorReport } from './doctor.js';
 import { searchWiki, formatSearchResults } from './search.js';
 import { distill, loadDistillState, applyTombstones } from './distill.js';
 import { compact } from './compact.js';
+import {
+  promoteScan,
+  promoteApply,
+  promoteReject,
+  promoteAdd,
+  promoteDemote,
+  loadNominations,
+  coreStatus,
+} from './promote.js';
 import { generateProbes, coverageCheck, pipelineMetrics, loadProbes, formatEvalReport } from './eval.js';
 import {
   runWriteback,
@@ -450,6 +459,7 @@ program
   .option('--from-sources', '数据源改用 sources/ 快照（透传测试）')
   .option('--force-batch3', '临时放行 batch:3 高风险批次（qoderwork/wukong）')
   .option('--full', '强制全量广播（忽略 pending-writeback.json 增量清单）')
+  .option('--core-only', '仅写回 wiki/core/ 核心层条目（验证/手动复活用）')
   .option('--repair', '修复 codex AGENTS.md 多标记区（去重合并，含备份；仅支持 --app codex）')
   .action(async (opts) => {
     // --repair：独立的修复流程，不进入写回管线
@@ -468,6 +478,7 @@ program
         fromSources: !!opts.fromSources,
         forceBatch3: !!opts.forceBatch3,
         full: !!opts.full,
+        coreOnly: !!opts.coreOnly,
         // SHOULD-6：交互命令 30s 抢锁超时（daemon 内部调用不传，维持 120s 默认）
         lockTimeoutMs: CLI_LOCK_TIMEOUT_MS,
       });
@@ -1150,6 +1161,137 @@ tombstoneCmd
       return;
     }
     console.log(`✅ 已撤销 tombstone ${hubId}（对应记忆不会被删除传播）`);
+  });
+
+// ---------------------------------------------------------------------------
+// hub promote / hub core —— 用户维度长期核心层（wiki/core/）晋升管道
+// ---------------------------------------------------------------------------
+
+const promoteCmd = program
+  .command('promote')
+  .description('晋升管道：wiki 主题页 → wiki/core/ 长期核心（scan 提名 / list / apply / reject / add / demote）');
+
+promoteCmd
+  .command('scan')
+  .description('四信号打分 +（可选）LLM 精炼提名，产出 state/promote-nominations.json（冷却期降级启发式）')
+  .option('--max-candidates <n>', '本次最多提名条数', '20')
+  .action(async (opts) => {
+    try {
+      const r = await promoteScan({ maxCandidates: Number(opts.maxCandidates) || 20 });
+      if (!r.ok) {
+        console.error(`❌ scan 跳过: ${r.error}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`✅ 扫描 ${r.scanned} 页，提名 ${r.nominated} 条（LLM: ${r.llm}）→ ${r.file}`);
+      if (r.nominated > 0) console.log('  运行 hub promote list 查看，hub promote apply --id <n> 确认晋升');
+    } catch (err) {
+      console.error(`❌ scan 失败: ${err.message}`);
+      process.exitCode = 1;
+    }
+  });
+
+promoteCmd
+  .command('list')
+  .description('展示待确认的晋升提名（信号分/建议动作/精炼稿摘要）')
+  .action(() => {
+    const noms = loadNominations();
+    if (noms.nominations.length === 0) {
+      console.log('没有待确认的提名（先运行 hub promote scan）');
+      return;
+    }
+    console.log(`提名清单（${noms.generatedAt}，LLM: ${noms.llm}）：`);
+    for (const n of noms.nominations) {
+      const sig = Object.entries(n.signals)
+        .map(([k, v]) => `${k}${v ? '✓' : '✗'}`)
+        .join(' ');
+      const action = n.action === 'profile' ? '并入用户画像' : n.action === 'merge' ? `并入 ${path.basename(n.targetCorePage)}` : '新建事实页';
+      console.log(`  #${n.id} [${n.score}分 ${sig}] ${n.title}`);
+      console.log(`      来源: ${n.sourcePage} → ${action}（category: ${n.category}）`);
+      if (n.draftBody) console.log(`      精炼稿: ${n.draftBody.slice(0, 80)}…`);
+    }
+    console.log('\nhub promote apply --id <n>（或 --all）确认；hub promote reject --id <n> 拒绝');
+  });
+
+promoteCmd
+  .command('apply')
+  .description('确认执行提名：写入 core 页并登记 promoted-from（容量满时拒绝新建）')
+  .option('--id <ids...>', '指定提名编号（可多个）')
+  .option('--all', '执行全部提名')
+  .action((opts) => {
+    if (!opts.all && (!opts.id || opts.id.length === 0)) {
+      console.error('❌ 请指定 --id <n> 或 --all');
+      process.exitCode = 1;
+      return;
+    }
+    const { results } = promoteApply({ ids: (opts.id || []).map(Number), all: !!opts.all });
+    if (results.length === 0) {
+      console.log('没有匹配的提名（hub promote list 查看现存编号）');
+      return;
+    }
+    for (const r of results) {
+      console.log(r.ok ? `✅ #${r.id} ${r.sourcePage} → ${r.file}` : `❌ #${r.id} ${r.sourcePage}: ${r.error}`);
+    }
+    if (results.some((r) => r.ok)) {
+      rebuildMasterIndex();
+      console.log('下一轮写回起 core 条目将每轮重申；可立即运行 hub writeback --core-only 验证');
+    }
+  });
+
+promoteCmd
+  .command('reject')
+  .description('拒绝提名并记负样本（同一来源页 30 天内不再提名）')
+  .requiredOption('--id <ids...>', '提名编号（可多个）')
+  .action((opts) => {
+    const { rejected } = promoteReject({ ids: opts.id.map(Number) });
+    console.log(rejected.length > 0 ? `✅ 已拒绝 ${rejected.length} 条：${rejected.join(', ')}` : '没有匹配的提名');
+  });
+
+promoteCmd
+  .command('add <source>')
+  .description('Phase 1 手动晋升：把 wiki 主题页确定性搬运到 core 层（无 LLM）')
+  .option('--to <corePage>', '并入既有 core 页（slug 或路径；user-profile 为画像固定页）')
+  .option('--category <c>', '写回 Qoder 的目标 category（缺省 project_introduction）')
+  .action((source, opts) => {
+    const r = promoteAdd({ source, to: opts.to, category: opts.category });
+    if (!r.ok) {
+      console.error(`❌ 晋升失败: ${r.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    rebuildMasterIndex();
+    console.log(`✅ 已晋升 → ${r.file}（hub-id: ${r.hubIds.join(', ')}）`);
+    console.log('运行 hub writeback --core-only 可立即验证写回');
+  });
+
+promoteCmd
+  .command('demote <page>')
+  .description('降级：core 页移回 wiki 顶层，hubId 登记 pending removals 清理 App 侧旧渲染')
+  .action((page) => {
+    const r = promoteDemote({ page });
+    if (!r.ok) {
+      console.error(`❌ 降级失败: ${r.error}`);
+      process.exitCode = 1;
+      return;
+    }
+    rebuildMasterIndex();
+    console.log(`✅ 已降级 → ${r.file}（App 侧旧渲染将在下轮写回时清理）`);
+  });
+
+program
+  .command('core')
+  .description('核心层状态：容量水位、页清单与最近一次写回结果')
+  .action(() => {
+    const s = coreStatus();
+    console.log(`核心层容量: ${s.capacity.used}/${s.capacity.max}`);
+    if (s.pages.length === 0) {
+      console.log('wiki/core/ 尚无页面（hub promote add/scan 开始晋升）');
+      return;
+    }
+    for (const p of s.pages) {
+      console.log(`  - [${p.category}] ${p.title}（${p.slug}，更新于 ${p.lastUpdated.slice(0, 10)}）`);
+      console.log(`      来源: ${p.promotedFrom.join(', ') || '（手工创建）'} | 写回: ${p.lastWriteback}`);
+    }
   });
 
 // ---------------------------------------------------------------------------

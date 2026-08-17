@@ -92,13 +92,22 @@ export function readPageIndexMeta(file) {
 /**
  * 全量重建 _index/master-index.md：包含全部页面、头部计数用实际值、
  * 每行回填该页 frontmatter 的 hub-id（H7）。
+ * 核心记忆（wiki/core/）独立成段置顶，与主题页分层展示。
  * 可独立调用（distill 每轮成功后自动执行；CLI `hub index` 的接线由集成任务处理）。
  * @returns {string} 生成的主索引文件路径
  */
 export function rebuildMasterIndex() {
   ensureHubStore();
   const pages = listWikiPages();
+  const corePrefix = `core${path.sep}`;
+  const corePages = pages.filter((p) => path.relative(storePaths.wiki, p).startsWith(corePrefix));
+  const topicPages = pages.filter((p) => !path.relative(storePaths.wiki, p).startsWith(corePrefix));
   const lines = ['# Master Index —— 中转站目录索引', ''];
+  const pushPageLine = (p) => {
+    const meta = readPageIndexMeta(p);
+    const idPart = `hub-id: ${meta.hubIds.length > 0 ? meta.hubIds.join(', ') : '无'}`;
+    lines.push(`- [${meta.title}](${meta.rel})${meta.summary ? ` — ${meta.summary}` : ''}（${idPart}）`);
+  };
   if (pages.length === 0) {
     lines.push(
       '> 当前 wiki/ 整理层尚无任何页面。',
@@ -106,12 +115,13 @@ export function rebuildMasterIndex() {
       '',
     );
   } else {
-    lines.push(`共 ${pages.length} 个页面：`, '');
-    for (const p of pages) {
-      const meta = readPageIndexMeta(p);
-      const idPart = `hub-id: ${meta.hubIds.length > 0 ? meta.hubIds.join(', ') : '无'}`;
-      lines.push(`- [${meta.title}](${meta.rel})${meta.summary ? ` — ${meta.summary}` : ''}（${idPart}）`);
+    if (corePages.length > 0) {
+      lines.push(`## 核心记忆（长期，${corePages.length} 页）`, '');
+      for (const p of corePages) pushPageLine(p);
+      lines.push('');
     }
+    lines.push(`## 主题页（${topicPages.length} 页）`, '');
+    for (const p of topicPages) pushPageLine(p);
     lines.push('');
   }
   atomicWrite(storePaths.masterIndex, lines.join('\n'), { mode: FILE_MODE });
