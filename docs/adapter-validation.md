@@ -136,7 +136,7 @@
 ### R2（Bug#3）跨进程回环抑制：✅ PASS（带遗留注记）
 
 - 机制落地：inflight 由进程内 Map 改为共享文件 `hub/state/inflight.json`（原子写 + 10 分钟 TTL）。CLI 写回时确认登记成功（写回后立即 cat 到对应路径 + sha256 条目）
-- **决定性证据**：watcher.log 第 506 行 `2026-08-05T17:07:26.966Z codex suppress 命中自写回环，丢弃 /Users/kuangju/Desktop/tool/AGENTS.md` —— 该文件由 CLI 进程于 17:07:24 写回（writeback-log 可查），由 daemon 进程的 watcher 抑制，跨进程抑制实锤
+- **决定性证据**：watcher.log 第 506 行 `2026-08-05T17:07:26.966Z codex suppress 命中自写回环，丢弃 ~/Desktop/tool/AGENTS.md` —— 该文件由 CLI 进程于 17:07:24 写回（writeback-log 可查），由 daemon 进程的 watcher 抑制，跨进程抑制实锤
 - daemon 16:59:58 周期写回 claude/codex 新文件后：`sources/claude` 与 `sources/codex` 均零 HUB-FIX 快照、watcher.log 零摄取记录
 - **遗留注记（qoder 通道）**：Qoder 客户端在写回后 ~1 秒内将文件改名（`HUB-FIX-…条目.md` → `[HUB-FIX-…]_条目.md`）并重写 frontmatter（路径与 hash 双变），inflight 的路径+hash 匹配无法覆盖改名后的文件，被 watcher/轮询摄取（sources/qoder 产生 3 条 HUB-FIX 快照：005855/010658/011000）。原 Bug#3（进程内 Map 跨进程完全失效）已修复；此遗留与上轮"观察项"中 Qoder 客户端改名行为同源，建议后续让摄取侧按内容 hub-id 标记识别自写条目（见第八节新问题 N1/N2）
 
@@ -186,7 +186,7 @@ $ grep -r 'HUB-FIX' ~/.claude/projects ~/.qoderwork ~/.qoder/memories ~/Desktop/
 | N1 | 中 | qoder 写回后客户端秒级改名+重写 frontmatter，inflight 按「路径+hash」匹配无法覆盖改名文件，写回内容仍经改名路径被摄取进 sources（回环兜底仍靠幂等） | R2 遗留注记；sources/qoder 3 条 HUB-FIX 快照 |
 | N2 | 中 | rollback 只按 manifest 原路径删新增文件，客户端改名后的文件不被清理（「零残留」承诺在 qoder 场景打折扣） | R3：`已恢复 0 个文件` 且改名文件仍在，需手工删除 |
 | N3 | 低 | `hub rollback --dir` 只接受完整路径，传备份时间戳名（如上轮报告用法）报「找不到可用的备份目录」，错误提示误导（实际是路径解析问题非无备份） | 首次 rollback 失败 rc=1，改绝对路径即成功 |
-| N4 | 低 | rollback 清单打印中 manifest 无 app 字段时显示 `[undefined]`（写回自身备份的 manifest 不记 app） | rollback 输出 `- [undefined] /Users/kuangju/...` |
+| N4 | 低 | rollback 清单打印中 manifest 无 app 字段时显示 `[undefined]`（写回自身备份的 manifest 不记 app） | rollback 输出 `- [undefined] ~/...` |
 | N5 | 观察 | Qoder 客户端会在外部删除其记忆文件后约 1 分钟复活文件（客户端同步行为）；测试清理需二次确认 | 01:09 复活事件，二次删除后未再复活 |
 | N6 | 观察 | daemon 周期写回（10 分钟）会自动把 wiki 条目写回各家；构造 wiki 测试页后若不及时删除，下个周期会被再次写回（本轮 17:09:58 发生过一次，已按纪律再次 rollback） | writeback-log 17:09:58 三条 written |
 

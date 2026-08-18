@@ -9,6 +9,14 @@
  * 数据用于评估：清理周期（半衰期）、清理偏好（category 分布）、写回净留存率、
  * 核心层重申成本（复活频率 = Qoder 整理机制与 reassert 的拉锯强度）。
  *
+ * 机器相关路径一律自动探测（不硬编码 profile id / 项目名 / 用户名）：
+ * - Qoder profile：~/.qoder/memories/<id>/projects，多个取最近活跃者，
+ *   可用环境变量 QODER_PROFILE_DIR 显式指定；
+ * - 项目 slug：缺省枚举 projects/ 下全部子目录，可用 QODER_PROJECT_SLUGS
+ *   （逗号分隔）限定；
+ * - 快照输出与核心层目录走 paths/storePaths，随 MEMORY_HUB_ROOT /
+ *   MEMORY_HUB_USER_ROOT 环境变量生效。
+ *
  * 用法：node scripts/qoder-retention-snapshot.js [--report]
  *   --report 只读模式：不追加快照，汇总 jsonl 输出留存曲线与半衰期估算。
  */
@@ -16,12 +24,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { paths } from '../src/util/paths.js';
+import { storePaths } from '../src/hub-store.js';
 
-const ROOT = path.join(os.homedir(), '.qoder/memories/019ea5c5/projects');
-const SLUGS = ['Users-kuangju-Desktop', 'Qoder-Chats'];
-const OUT = path.join(os.homedir(), '.memory-hub/state/qoder-retention.jsonl');
+/** 快照台账（state/qoder-retention.jsonl，随 MEMORY_HUB_ROOT 生效） */
+const OUT = path.join(paths.state, 'qoder-retention.jsonl');
 /** 核心层目录（wiki/core/，hubId 取自页 frontmatter） */
-const CORE_DIR = path.join(os.homedir(), 'Desktop/Memory Hub/wiki/core');
+const CORE_DIR = path.join(storePaths.wiki, 'core');
 
 const readSafe = (p) => {
   try {
@@ -31,9 +40,51 @@ const readSafe = (p) => {
   }
 };
 
+/**
+ * 解析 Qoder profile 的 projects 根目录。
+ * 优先 QODER_PROFILE_DIR（指向 memories/<id>）；缺省扫描 ~/.qoder/memories/
+ * 下含 projects/ 子目录的 profile，多个时取 mtime 最新（最近活跃）者。
+ */
+function resolveProjectsRoot() {
+  if (process.env.QODER_PROFILE_DIR) {
+    return path.join(process.env.QODER_PROFILE_DIR, 'projects');
+  }
+  const base = path.join(os.homedir(), '.qoder', 'memories');
+  let candidates = [];
+  try {
+    candidates = fs
+      .readdirSync(base, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && fs.existsSync(path.join(base, e.name, 'projects')))
+      .map((e) => path.join(base, e.name));
+  } catch {
+    // memories 目录不存在：下方统一报错
+  }
+  if (candidates.length === 0) {
+    console.error(`未找到 Qoder profile（${base}/<id>/projects），可用环境变量 QODER_PROFILE_DIR 显式指定`);
+    process.exit(1);
+  }
+  candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return path.join(candidates[0], 'projects');
+}
+
+/** 解析要扫描的项目 slug 清单：QODER_PROJECT_SLUGS 限定，缺省枚举全部子目录 */
+function resolveSlugs(root) {
+  if (process.env.QODER_PROJECT_SLUGS) {
+    return process.env.QODER_PROJECT_SLUGS.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  try {
+    return fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
 /** 扫描一个 slug：返回 { count, byCategory, hubIds } */
-function scanSlug(slug) {
-  const base = path.join(ROOT, slug);
+function scanSlug(root, slug) {
+  const base = path.join(root, slug);
   const byCategory = {};
   const hubIds = [];
   const walk = (dir) => {
@@ -104,29 +155,31 @@ function loadHistory() {
     .map((l) => JSON.parse(l));
 }
 
+/** 汇总一行快照的全 slug 存量 */
+function totalOf(h) {
+  return Object.values(h.slugs).reduce((a, s) => a + (s.count ?? 0), 0);
+}
+
 function report(history) {
   if (history.length === 0) {
     console.log('暂无快照数据，先运行一次不带 --report 的快照。');
     return;
   }
-  console.log('时间\t\t\tDesktop\tChats\t合计\t较上次');
+  console.log('时间\t\t\t合计\t较上次\t各项目明细');
   let prev = null;
   for (const h of history) {
-    const d = h.slugs['Users-kuangju-Desktop']?.count ?? 0;
-    const c = h.slugs['Qoder-Chats']?.count ?? 0;
-    const delta = prev === null ? '-' : d + c - prev;
-    console.log(`${h.time}\t${d}\t${c}\t${d + c}\t${delta}`);
-    prev = d + c;
+    const total = totalOf(h);
+    const detail = Object.entries(h.slugs)
+      .map(([k, v]) => `${k}=${v.count}`)
+      .join(' ');
+    console.log(`${h.time}\t${total}\t${prev === null ? '-' : total - prev}\t${detail}`);
+    prev = total;
   }
   // 半衰期估算：用首末两点做指数衰减拟合 N(t)=N0*exp(-λt)
   if (history.length >= 2) {
-    const first = history[0];
-    const last = history[history.length - 1];
-    const n0 =
-      (first.slugs['Users-kuangju-Desktop']?.count ?? 0) + (first.slugs['Qoder-Chats']?.count ?? 0);
-    const n1 =
-      (last.slugs['Users-kuangju-Desktop']?.count ?? 0) + (last.slugs['Qoder-Chats']?.count ?? 0);
-    const hours = (new Date(last.time) - new Date(first.time)) / 3.6e6;
+    const n0 = totalOf(history[0]);
+    const n1 = totalOf(history[history.length - 1]);
+    const hours = (new Date(history[history.length - 1].time) - new Date(history[0].time)) / 3.6e6;
     if (n1 < n0 && n1 > 0 && hours > 0) {
       const lambda = Math.log(n0 / n1) / hours;
       console.log(
@@ -135,7 +188,7 @@ function report(history) {
     } else {
       console.log('\n窗口内无净衰减，暂不估算半衰期。');
     }
-    // 最近一次 diff 的 category 汇总
+    // 最近一次 diff 的清理/新增汇总
     const lastDiff = history[history.length - 1].diff;
     if (lastDiff && lastDiff.removed.length > 0) {
       console.log(`最近一次快照被清理 ${lastDiff.removed.length} 条 / 新增 ${lastDiff.added.length} 条`);
@@ -163,13 +216,16 @@ function report(history) {
 const isReport = process.argv.includes('--report');
 const history = loadHistory();
 if (isReport) {
+  // 只读模式不要求本机存在 Qoder 目录（可在任意机器上汇总 jsonl）
   report(history);
   process.exit(0);
 }
 
+const root = resolveProjectsRoot();
+const slugs = resolveSlugs(root);
 const snapshot = {
   time: new Date().toISOString(),
-  slugs: Object.fromEntries(SLUGS.map((s) => [s, scanSlug(s)])),
+  slugs: Object.fromEntries(slugs.map((s) => [s, scanSlug(root, s)])),
   core: { hubIds: scanCoreHubIds() },
 };
 const prevIds = new Set(
@@ -184,6 +240,6 @@ fs.mkdirSync(path.dirname(OUT), { recursive: true });
 fs.appendFileSync(OUT, `${JSON.stringify(snapshot)}\n`);
 const total = Object.values(snapshot.slugs).reduce((a, s) => a + s.count, 0);
 console.log(
-  `快照已记录：合计 ${total} 条（${SLUGS.map((s) => `${s}=${snapshot.slugs[s].count}`).join(', ')}）` +
+  `快照已记录：合计 ${total} 条（${slugs.map((s) => `${s}=${snapshot.slugs[s].count}`).join(', ')}）` +
     (history.length > 0 ? `，较上次 清理${snapshot.diff.removed.length}/新增${snapshot.diff.added.length}` : ''),
 );

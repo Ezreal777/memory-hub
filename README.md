@@ -97,8 +97,11 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `compact.intervalMs` | 自动归并最小间隔（缺省 24 小时） |
 | `compact.minClusterSize` | 主题簇 ≥ 该页数才归并（缺省 3） |
 | `compact.maxClustersPerRun` / `compact.maxPagesPerCall` | 单轮最多处理簇数（缺省 4）/ 单次 LLM 调用最多送入页数（缺省 8，大簇分块跨轮收敛） |
-| `llm.baseUrl` / `llm.model` | OpenAI 兼容 LLM 端点与模型（`hub keys use` 可一并配置） |
+| `llm.baseUrl` / `llm.model` | OpenAI 兼容 LLM 端点与模型（`hub keys use` 可一并配置）；批量蒸馏建议非推理模型（推理链占输出配额易致空回复） |
 | `llm.keyRef` | Keychain 密钥引用名（密钥本体只在 Keychain，绝不落盘） |
+| `llm.hourlyCallCap` / `llm.dailyCallCap` | LLM 调用预算刹车（缺省 0 = 不启用）：hub 自身每小时/每日调用上限（含失败调用，网关同样计数），给同一 AK 的交互使用留余量。超额自动暂停（小时预算 → 暂停 1 小时；日预算 → 暂停到本地次日凌晨）。台账在 `state/llm-usage.json`，仅真实网关调用记账。示例：免费档 10 次/时 + 200 次/天 可配 `8` / `150` |
+| `core.enabled` / `core.reassertEveryRound` | 长期核心层（wiki/core/）总开关与每轮重申开关（缺省均 `true`：增量写回无条件重申 core 条目，App 侧被清后自动复活） |
+| `core.maxEntries` / `core.survivalDays` / `core.minScore` / `core.scanIntervalMs` | 核心层容量上限（缺省 50）/ 晋升存活信号天数（缺省 15）/ 提名最低信号分（缺省 3）/ daemon 自动扫描提名间隔（缺省 7 天；只产提名，`hub promote apply` 确认后才写 core） |
 
 数据根目录缺省 `~/.memory-hub`，可用环境变量 **`MEMORY_HUB_ROOT`** 覆盖；
 用户可视目录缺省 `~/Desktop/Memory Hub`，可用 **`MEMORY_HUB_USER_ROOT`** 覆盖
@@ -215,6 +218,27 @@ hub writeback --repair
 边界：聚合文件（如 codex AGENTS.md）内单条目删除不产生 unlink 事件，当前不检测（仅整文件
 删除触发）；wiki 页中被 LLM 归并进无 `[hub-id]` 标记的散文段落无法定位剔除，只能靠页级
 `deleted` 标记兜底。
+
+## Qoder 留存快照脚本（scripts/qoder-retention-snapshot.js）
+
+评估 Qoder 整理机制对 hub 写回记忆的清理周期（半衰期）与核心层重申效果：
+
+```bash
+node scripts/qoder-retention-snapshot.js            # 追加一次快照（state/qoder-retention.jsonl）
+node scripts/qoder-retention-snapshot.js --report   # 只读汇总：留存曲线 / 半衰期估算 / 核心层复活统计
+```
+
+机器相关路径全部自动探测，无需硬编码：
+
+| 配置 | 缺省行为 | 覆盖方式 |
+| --- | --- | --- |
+| Qoder profile 目录 | 自动探测 `~/.qoder/memories/<id>/projects`（多个 profile 时取最近活跃者） | 环境变量 `QODER_PROFILE_DIR=/path/to/.qoder/memories/<id>` |
+| 项目 slug 清单 | 自动枚举 projects/ 下全部子目录 | 环境变量 `QODER_PROJECT_SLUGS=SlugA,SlugB`（逗号分隔，固定口径时建议显式限定） |
+| 快照台账 / 核心层目录 | `state/qoder-retention.jsonl` 与 `wiki/core/` | 随 `MEMORY_HUB_ROOT` / `MEMORY_HUB_USER_ROOT` 环境变量生效 |
+
+`--report` 只读模式不要求本机存在 Qoder 目录，可在任意机器上汇总 jsonl。
+搭配定时任务（如每日一次快照）可积累衰减曲线；核心层条目预期重申覆盖 100%，
+复活频繁（>10 次）提示应在 Qoder 面板手动确认提升记忆成熟度。
 
 ## 日志与排障
 
