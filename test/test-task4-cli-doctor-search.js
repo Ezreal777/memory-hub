@@ -337,7 +337,7 @@ test('search：多关键词 AND、大小写不敏感，输出标题/hub-id/首�
   assert.equal(res.total, 1);
   assert.equal(res.results.length, 1);
   const hit = res.results[0];
-  assert.equal(hit.rel, 'alpha-beta.md');
+  assert.equal(hit.rel, path.join('wiki', 'alpha-beta.md')); // rel 改为 hub 根相对（区分 core/ 与 wiki/）
   assert.equal(hit.title, '商品对比CVR分析');
   assert.deepEqual(hit.hubIds, ['hub-s-1', 'hub-s-2']);
   assert.ok(hit.lineNo > 0);
@@ -354,7 +354,7 @@ test('search：tags/frontmatter 命中、--limit 截断但总命中数照报、�
   writePage('tagged', { title: '标签页', hubIds: ['hub-t-1'], tags: ['转人工率'], body: '正文不含该词' });
   const tagRes = searchWiki(['转人工率']);
   assert.equal(tagRes.total, 1);
-  assert.equal(tagRes.results[0].rel, 'tagged.md');
+  assert.equal(tagRes.results[0].rel, path.join('wiki', 'tagged.md'));
 
   for (let i = 1; i <= 3; i += 1) {
     writePage(`zeta-${i}`, { title: `Zeta页${i}`, hubIds: [`hub-z-${i}`], body: '关键词 zeta 出现' });
@@ -364,7 +364,7 @@ test('search：tags/frontmatter 命中、--limit 截断但总命中数照报、�
   assert.equal(res.results.length, 2);
   const text = formatSearchResults(res);
   assert.match(text, /关键词: zeta —— 命中 3 页（仅显示前 2 条/);
-  assert.match(text, /1\. zeta-1\.md · Zeta页1（hub-id: hub-z-1）/);
+  assert.match(text, /1\. wiki\/zeta-1\.md · Zeta页1（hub-id: hub-z-1）/);
   assert.match(text, /L\d+: /);
   // 缺省 limit 为 20
   assert.equal(searchWiki(['zeta']).limit, DEFAULT_SEARCH_LIMIT);

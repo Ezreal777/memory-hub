@@ -26,6 +26,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { loadConfig } from './config.js';
 import { storePaths, loadTombstones, updateTombstones } from './hub-store.js';
+import { listCorePages, adoptCorePages } from './core-store.js';
 import { atomicWrite, rollbackByManifest } from './safe-write.js';
 import { paths, ensureDir, FILE_MODE } from './util/paths.js';
 import { withLock } from './util/lock.js';
@@ -254,7 +255,13 @@ function listWikiPages() {
  */
 export function wikiToEntries() {
   const entries = [];
-  for (const page of listWikiPages()) {
+  // 领养手动编辑的 core 页（补发契约 frontmatter），再枚举 wiki 主题页 + core 页
+  try {
+    adoptCorePages();
+  } catch {
+    // 领养失败不阻塞写回（未领养页无 hub-id 会被下方过滤，下轮再试）
+  }
+  for (const page of [...listWikiPages(), ...listCorePages()]) {
     let content;
     try {
       content = fs.readFileSync(page, 'utf8');

@@ -12,6 +12,7 @@ import path from 'node:path';
 import matter from 'gray-matter';
 import { storePaths } from './hub-store.js';
 import { listWikiPages } from './index-builder.js';
+import { listCorePages } from './core-store.js';
 
 /** 缺省最多展示的命中条数 */
 export const DEFAULT_SEARCH_LIMIT = 20;
@@ -37,7 +38,7 @@ export function searchWiki(keywords, opts = {}) {
 
   let total = 0;
   const results = [];
-  for (const file of listWikiPages()) {
+  for (const file of [...listCorePages(), ...listWikiPages()]) {
     let raw;
     try {
       raw = fs.readFileSync(file, 'utf8');
@@ -79,7 +80,7 @@ export function searchWiki(keywords, opts = {}) {
     }
     if (excerpt.length > EXCERPT_MAX_CHARS) excerpt = `${excerpt.slice(0, EXCERPT_MAX_CHARS)}…`;
 
-    results.push({ file, rel: path.relative(storePaths.wiki, file), title, hubIds, lineNo, excerpt });
+    results.push({ file, rel: path.relative(storePaths.root, file), title, hubIds, lineNo, excerpt });
   }
   return { keywords: kws, total, limit, results };
 }

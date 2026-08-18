@@ -25,12 +25,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { paths } from '../src/util/paths.js';
-import { storePaths } from '../src/hub-store.js';
+import { corePaths } from '../src/core-store.js';
 
 /** 快照台账（state/qoder-retention.jsonl，随 MEMORY_HUB_ROOT 生效） */
 const OUT = path.join(paths.state, 'qoder-retention.jsonl');
-/** 核心层目录（wiki/core/，hubId 取自页 frontmatter） */
-const CORE_DIR = path.join(storePaths.wiki, 'core');
+/** 核心层目录（顶层 core/，hubId 取自页 frontmatter） */
+const CORE_DIR = corePaths.root;
 
 const readSafe = (p) => {
   try {

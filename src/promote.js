@@ -631,7 +631,8 @@ export function promoteAdd(opts) {
     draftBody: body,
   };
   // --to user-profile 语义糖：并入用户画像固定单页
-  if (opts.to && path.basename(nomination.targetCorePage, '.md') === 'user-profile') {
+  // --to user / user-profile 语义糖：并入用户画像固定页（core/user.md）
+  if (opts.to && ['user', 'user-profile'].includes(path.basename(nomination.targetCorePage, '.md'))) {
     nomination.action = 'profile';
   }
   const r = applyNomination(nomination, { maxEntries, now: opts.now });

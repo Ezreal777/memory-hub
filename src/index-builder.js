@@ -16,6 +16,7 @@ import matter from 'gray-matter';
 import { FILE_MODE } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
 import { storePaths, ensureHubStore } from './hub-store.js';
+import { listCorePages } from './core-store.js';
 
 /**
  * 递归收集 wiki/ 下的 .md 页面（跳过 README.md 占位与隐藏文件）。
@@ -98,15 +99,16 @@ export function readPageIndexMeta(file) {
  */
 export function rebuildMasterIndex() {
   ensureHubStore();
-  const pages = listWikiPages();
-  const corePrefix = `core${path.sep}`;
-  const corePages = pages.filter((p) => path.relative(storePaths.wiki, p).startsWith(corePrefix));
-  const topicPages = pages.filter((p) => !path.relative(storePaths.wiki, p).startsWith(corePrefix));
+  // core 已提升为顶层目录（与 wiki 平级）：主题页与核心页分別枚举
+  const topicPages = listWikiPages();
+  const corePages = listCorePages();
+  const pages = [...corePages, ...topicPages];
   const lines = ['# Master Index —— 中转站目录索引', ''];
-  const pushPageLine = (p) => {
+  const pushPageLine = (p, relOverride) => {
     const meta = readPageIndexMeta(p);
+    const rel = relOverride ?? meta.rel;
     const idPart = `hub-id: ${meta.hubIds.length > 0 ? meta.hubIds.join(', ') : '无'}`;
-    lines.push(`- [${meta.title}](${meta.rel})${meta.summary ? ` — ${meta.summary}` : ''}（${idPart}）`);
+    lines.push(`- [${meta.title}](${rel})${meta.summary ? ` — ${meta.summary}` : ''}（${idPart}）`);
   };
   if (pages.length === 0) {
     lines.push(
@@ -117,7 +119,7 @@ export function rebuildMasterIndex() {
   } else {
     if (corePages.length > 0) {
       lines.push(`## 核心记忆（长期，${corePages.length} 页）`, '');
-      for (const p of corePages) pushPageLine(p);
+      for (const p of corePages) pushPageLine(p, path.relative(storePaths.root, p));
       lines.push('');
     }
     lines.push(`## 主题页（${topicPages.length} 页）`, '');

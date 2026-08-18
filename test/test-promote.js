@@ -24,7 +24,15 @@ import path from 'node:path';
 import matter from 'gray-matter';
 
 import { storePaths } from '../src/hub-store.js';
-import { corePaths, writeCorePage, readCorePage, listCorePages, countCorePages } from '../src/core-store.js';
+import {
+  corePaths,
+  writeCorePage,
+  readCorePage,
+  listCorePages,
+  countCorePages,
+  adoptCorePages,
+  migrateCoreLayout,
+} from '../src/core-store.js';
 import {
   scorePage,
   promoteAdd,
@@ -474,4 +482,68 @@ test('promoteAutoApply：verdict+置信度双门槛、每轮限额、reject 负�
   // autoPromote=false：回退人工把关
   const off = promoteAutoApply({ config: { core: coreConfig({ autoPromote: false }) } });
   assert.equal(off.skipped, 'off');
+});
+
+// ---------------------------------------------------------------------------
+// 9. 顶层 core/ 布局：旧布局迁移 + 手动编辑领养
+// ---------------------------------------------------------------------------
+
+test('migrateCoreLayout：wiki/core 旧布局幂等迁移，user-profile.md → user.md', () => {
+  const root = freshHubRoot();
+  // 伪造旧布局：wiki/core/user-profile.md + facts 页
+  const legacy = path.join(root, 'hub', 'wiki', 'core');
+  fs.mkdirSync(path.join(legacy, 'facts'), { recursive: true });
+  fs.writeFileSync(
+    path.join(legacy, 'user-profile.md'),
+    matter.stringify({ content: '# 用户画像\n\n正文。\n' }, { 'hub-id': ['hub-20260817000000-aaaaaa'], tier: 'core', category: 'user_info' }),
+  );
+  fs.writeFileSync(
+    path.join(legacy, 'facts', 'old-fact.md'),
+    matter.stringify({ content: '# 旧事实\n\n正文。\n' }, { 'hub-id': ['hub-20260817000000-bbbbbb'], tier: 'core', category: 'user_info' }),
+  );
+
+  const pages = listCorePages(); // 触发迁移
+  assert.ok(!fs.existsSync(legacy), '旧目录已清空');
+  assert.ok(fs.existsSync(corePaths.userProfile), 'user-profile.md 已更名为 core/user.md');
+  assert.ok(fs.existsSync(path.join(corePaths.facts, 'old-fact.md')), 'facts 页随迁');
+  assert.equal(pages.length + listCorePages().length - listCorePages().length, pages.length); // 幂等再调不炸
+  assert.equal(readCorePage(corePaths.userProfile).hubIds[0], 'hub-20260817000000-aaaaaa', '迁移保留 hub-id');
+  // core 不在 wiki 内：compact 隔离天然成立
+  assert.ok(!corePaths.root.startsWith(storePaths.wiki));
+});
+
+test('adoptCorePages：手动新增/坏 YAML 页自动领养，既有契约页不动，领养后参与写回', async () => {
+  const root = freshHubRoot();
+  fs.mkdirSync(corePaths.root, { recursive: true });
+  // 1) 裸 markdown（用户新建 soul.md，无 frontmatter）
+  fs.writeFileSync(corePaths.soul, '# 协作之魂\n\n有观点直说，行动为主。\n');
+  // 2) 坏 YAML 页
+  fs.writeFileSync(path.join(corePaths.root, 'broken.md'), '---\ntitle: [未闭合\n---\n# 坏页\n\n正文仍在。\n');
+  // 3) 既有契约页（不应被改写）
+  const ok = writeCorePage({ title: '契约页', body: '正文。', now: '2026-08-19T00:00:00.000Z' });
+  const beforeRaw = fs.readFileSync(ok.file, 'utf8');
+  // 4) 空文件（正在编辑）跳过
+  fs.writeFileSync(path.join(corePaths.root, 'empty.md'), '');
+
+  const { adopted } = adoptCorePages({ now: '2026-08-19T01:00:00.000Z' });
+  assert.deepEqual(adopted.sort(), ['broken.md', 'soul.md']);
+  const soul = readCorePage(corePaths.soul);
+  assert.equal(soul.title, '协作之魂');
+  assert.equal(soul.category, 'user_info', '固定页按文件名映射 category');
+  assert.match(soul.hubIds[0], /^hub-\d{14}-/);
+  assert.deepEqual(soul.promotedFrom, ['manual-edit']);
+  assert.match(soul.body, /有观点直说/, '正文原样保留');
+  const broken = readCorePage(path.join(corePaths.root, 'broken.md'));
+  assert.ok(broken && /正文仍在/.test(broken.body), '坏 YAML 整文件按正文领养');
+  assert.equal(fs.readFileSync(ok.file, 'utf8'), beforeRaw, '既有契约页不动');
+  // 幂等：再领养无新增
+  assert.equal(adoptCorePages().adopted.length, 0);
+
+  // 领养后自动进写回清单（wikiToEntries 含 core 页且带 tier）
+  fs.mkdirSync(storePaths.wiki, { recursive: true });
+  const entries = wikiToEntries();
+  const soulEntry = entries.find((e) => e.hubId === soul.hubIds[0]);
+  assert.ok(soulEntry, '领养页进入写回枚举');
+  assert.equal(soulEntry.tier, 'core');
+  assert.equal(soulEntry.frontmatter.category, 'user_info');
 });
