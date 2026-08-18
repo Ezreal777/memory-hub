@@ -86,7 +86,7 @@ after(() => {
 // 1. 五个适配器 parse 正确产出条目
 // ---------------------------------------------------------------------------
 
-test('claude：MEMORY.md 索引行 + 独立条目 frontmatter 均正确解析', async () => {
+test('claude：MEMORY.md 索引行不摄取（回声盲区）+ 独立条目 frontmatter 正确解析', async () => {
   const { ClaudeAdapter } = await import('../src/adapters/claude.js');
   const home = freshFakeHome();
   const memDir = path.join(home, '.claude/projects/proj/memory');
@@ -111,12 +111,10 @@ test('claude：MEMORY.md 索引行 + 独立条目 frontmatter 均正确解析', 
   const files = adapter.discover();
   assert.equal(files.length, 2, '发现 MEMORY.md + 独立条目');
 
-  // 索引文件 → 每行一个条目
+  // 索引文件 → 不产出任何条目：条目本体由条目文件单独摄取，索引行是纯冗余；
+  // 且 hub 写回追加的索引行无任何回声指纹，曾造成 1.8 万条索引回声快照
   const idx = adapter.parse(adapter.read(path.join(memDir, 'MEMORY.md')));
-  assert.equal(idx.length, 2);
-  assert.equal(idx[0].title, 'User Identity');
-  assert.equal(idx[0].body, '狂且，好朋友');
-  assert.equal(idx[0].frontmatter.target, 'user_identity.md');
+  assert.equal(idx.length, 0, 'MEMORY.md 索引行不再被摄取');
 
   // 独立条目 → frontmatter 原始数据保留
   const entry = adapter.parse(adapter.read(path.join(memDir, 'user_identity.md')))[0];

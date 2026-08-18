@@ -3,6 +3,10 @@
  *
  * 实测格式（~/.claude/projects/<项目>/memory/）：
  * 1. MEMORY.md 索引文件：每行形如 `- [标题](文件名.md) — 摘要`；
+ *    【不摄取】索引行是导航元数据：条目本体由条目文件单独摄取，摄取索引行对
+ *    原生条目是纯冗余；且 hub 写回会向 MEMORY.md 追加索引行（无 hubId 水印，
+ *    三条回声指纹全部漏网），每次重写触发整文件重新摄取，曾造成 1.8 万条
+ *    索引回声快照（claude 源占比 99.7%）与 wiki 重复标题页；
  * 2. 同目录独立条目 <name>.md：YAML frontmatter（name/description/metadata{node_type,type,...}）+ 正文。
  *
  * watchPaths = config 中该 app 的 memory_paths（即 .../memory 目录）。
@@ -26,9 +30,6 @@ import {
   readFileSafe,
 } from './base.js';
 import { writeFilesSafely, removeFilesSafely, statSafe } from './write-utils.js';
-
-/** 索引行匹配：`- [标题](目标.md) — 摘要`（分隔符兼容 — / – / -） */
-const INDEX_LINE_RE = /^\s*[-*]\s*\[([^\]]+)\]\(([^)]+)\)\s*[—–-]?\s*(.*)$/;
 
 /**
  * 安全解析 frontmatter：解析失败返回 { data: null, body: 原内容 }。
@@ -73,31 +74,11 @@ export class ClaudeAdapter extends BaseAdapter {
   parse(raw) {
     const base = path.basename(raw.path);
     if (base === 'MEMORY.md') {
-      return this.parseIndex(raw);
+      // 索引文件不产出条目（见文件头注释：纯冗余 + 回声盲区）；
+      // 文件本身仍被 hash-state 跟踪，变更不再触发任何摄取
+      return [];
     }
     return this.parseEntryFile(raw);
-  }
-
-  /** 解析 MEMORY.md 索引：每行一个条目（标题=链接文本，正文=摘要） */
-  parseIndex(raw) {
-    const entries = [];
-    for (const line of raw.content.split(/\r?\n/)) {
-      const m = line.match(INDEX_LINE_RE);
-      if (!m) continue;
-      const [, title, target, summary] = m;
-      entries.push(
-        makeEntry({
-          app: this.id,
-          file: raw.path,
-          title: title.trim(),
-          body: summary.trim(),
-          frontmatter: { kind: 'index', target: target.trim() },
-          mtime: raw.mtimeMs,
-          sha256: raw.sha256,
-        }),
-      );
-    }
-    return entries;
   }
 
   /** 解析独立条目文件：YAML frontmatter + 正文 */

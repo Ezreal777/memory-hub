@@ -237,10 +237,10 @@ test('hub sync：隔离环境跑通 harvest → distill 优雅降级 → writeba
 
   const result = await runSync();
 
-  // 1) harvest：摄取到快照（MEMORY.md 索引 1 条 + 条目文件 1 条）
-  assert.ok(result.ingested >= 2, `期望至少摄取 2 条快照，实际 ${result.ingested}`);
+  // 1) harvest：摄取到快照（仅条目文件 1 条；MEMORY.md 索引行不摄取，见 claude 适配器）
+  assert.ok(result.ingested >= 1, `期望至少摄取 1 条快照，实际 ${result.ingested}`);
   const sourcesDir = path.join(paths.hub, 'sources', 'claude');
-  assert.ok(fs.existsSync(sourcesDir) && fs.readdirSync(sourcesDir).length >= 2);
+  assert.ok(fs.existsSync(sourcesDir) && fs.readdirSync(sourcesDir).length >= 1);
 
   // 2) distill：LLM 未配置 → 优雅降级（ok=false 且不抛异常）
   assert.equal(result.distill.ok, false);

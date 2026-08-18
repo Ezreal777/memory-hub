@@ -339,7 +339,8 @@ test('M3：dirWindow 命中只丢事件不记指纹（窗口内真实外部修�
   const { registerDirWindow } = await import('../src/inflight.js');
   freshHubRoot();
   const memDir = freshTmpDir('mh-rv-m3-');
-  const file = writeAt(memDir, 'MEMORY.md', '- [a](a.md) — 摘要1\n');
+  // 用独立条目文件做夹具（MEMORY.md 索引行已不再摄取，见 claude 适配器头注释）
+  const file = writeAt(memDir, 'a.md', '---\nname: a\n---\n摘要1\n');
   const adapter = new ClaudeAdapter({ id: 'claude', enabled: true, memory_paths: [memDir] });
   const first = harvest(adapter);
   assert.equal(first.ingested, 1);
@@ -347,7 +348,7 @@ test('M3：dirWindow 命中只丢事件不记指纹（窗口内真实外部修�
 
   // 写回登记目录宽限窗口后，文件被「外部」真实修改
   registerDirWindow(memDir);
-  fs.writeFileSync(file, '- [a](a.md) — 摘要1\n- [b](b.md) — 摘要2\n');
+  fs.writeFileSync(file, '---\nname: a\n---\n摘要1\n摘要2\n');
   const second = harvest(adapter);
   assert.equal(second.ingested, 0, 'dirWindow 命中期间事件被抑制');
   assert.equal(loadHashState().files[file].sha256, oldSha, '抑制期间绝不写新指纹（否则窗口过期后也漏摄取）');
