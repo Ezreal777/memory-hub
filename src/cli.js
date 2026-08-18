@@ -51,6 +51,7 @@ import { compact } from './compact.js';
 import {
   promoteScan,
   promoteApply,
+  promoteAutoApply,
   promoteReject,
   promoteAdd,
   promoteDemote,
@@ -1169,12 +1170,13 @@ tombstoneCmd
 
 const promoteCmd = program
   .command('promote')
-  .description('晋升管道：wiki 主题页 → wiki/core/ 长期核心（scan 提名 / list / apply / reject / add / demote）');
+  .description('晋升管道：wiki 主题页 → wiki/core/ 长期核心（scan 含 LLM 终审自动晋升 / list / apply / reject / add / demote）');
 
 promoteCmd
   .command('scan')
-  .description('四信号打分 +（可选）LLM 精炼提名，产出 state/promote-nominations.json（冷却期降级启发式）')
+  .description('四信号打分 + LLM 终审提名，默认接自动晋升（verdict=promote 且置信度达标；--no-auto 只提名）')
   .option('--max-candidates <n>', '本次最多提名条数', '20')
+  .option('--no-auto', '只产提名清单，不执行自动晋升（人工 apply 把关）')
   .action(async (opts) => {
     try {
       const r = await promoteScan({ maxCandidates: Number(opts.maxCandidates) || 20 });
@@ -1184,7 +1186,17 @@ promoteCmd
         return;
       }
       console.log(`✅ 扫描 ${r.scanned} 页，提名 ${r.nominated} 条（LLM: ${r.llm}）→ ${r.file}`);
-      if (r.nominated > 0) console.log('  运行 hub promote list 查看，hub promote apply --id <n> 确认晋升');
+      if (opts.auto !== false) {
+        const a = promoteAutoApply({});
+        if (a.applied.length > 0) {
+          for (const x of a.applied) console.log(`🎖️ 自动晋升：《${x.title}》 ← ${x.sourcePage}`);
+          console.log(`（拒绝 ${a.rejected.length} / 待定 ${a.deferred}；hub promote demote 可撤销）`);
+        } else {
+          console.log(`自动晋升 0 条${a.skipped ? `（${a.skipped}）` : `（拒绝 ${a.rejected.length} / 待定 ${a.deferred}）`}`);
+        }
+      } else if (r.nominated > 0) {
+        console.log('  运行 hub promote list 查看，hub promote apply --id <n> 确认晋升');
+      }
     } catch (err) {
       console.error(`❌ scan 失败: ${err.message}`);
       process.exitCode = 1;
@@ -1206,7 +1218,8 @@ promoteCmd
         .map(([k, v]) => `${k}${v ? '✓' : '✗'}`)
         .join(' ');
       const action = n.action === 'profile' ? '并入用户画像' : n.action === 'merge' ? `并入 ${path.basename(n.targetCorePage)}` : '新建事实页';
-      console.log(`  #${n.id} [${n.score}分 ${sig}] ${n.title}`);
+      const judge = n.verdict ? ` [终审 ${n.verdict} ${Number(n.confidence).toFixed(2)}${n.reason ? ` · ${n.reason}` : ''}]` : '';
+      console.log(`  #${n.id} [${n.score}分 ${sig}]${judge} ${n.title}`);
       console.log(`      来源: ${n.sourcePage} → ${action}（category: ${n.category}）`);
       if (n.draftBody) console.log(`      精炼稿: ${n.draftBody.slice(0, 80)}…`);
     }

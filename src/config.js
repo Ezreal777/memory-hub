@@ -82,6 +82,10 @@ export function defaultConfig() {
       reassertEveryRound: true, // 增量写回轮次无条件重申 core 条目（被清即复活）
       minScore: 3, // 晋升提名最低信号分（四信号各 1 分）
       scanIntervalMs: 7 * 24 * 60 * 60 * 1000, // promote scan 最小间隔（每周），daemon 兜底触发
+      // LLM 终审自动晋升（取代人工 apply 把关，详见 promote.js promoteAutoApply）
+      autoPromote: true, // false 则回退为只提名、人工 hub promote apply 确认
+      autoConfidence: 0.7, // 自动晋升的 LLM 置信度门槛（verdict=promote 且 ≥ 此值）
+      maxAutoPromotePerScan: 3, // 每轮 scan 最多自动晋升条数（防一次灌爆稀缺容量）
     },
     // daemon 事件驱动调度阈值（详见 daemon.js：达阈值提前整理，否则等 1 小时兜底扫描）
     daemon: {

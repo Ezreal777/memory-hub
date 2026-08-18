@@ -36,6 +36,7 @@ import { loadConfig } from './config.js';
 import { llmCooldownRemaining, buildRealClient } from './distill.js';
 import { pendingWritebackPath, loadPendingWriteback, loadWritebackLog } from './writeback.js';
 import { atomicWrite } from './safe-write.js';
+import { rebuildMasterIndex } from './index-builder.js';
 import { ensureDir, FILE_MODE } from './util/paths.js';
 import { withLock } from './util/lock.js';
 
@@ -263,14 +264,22 @@ function parseLlmJson(text) {
 }
 
 const SCAN_PROMPT = [
-  '你是长期记忆晋升引擎。输入是一组候选 wiki 主题页（JSON 数组，含 title/body 摘录/signals），',
-  '它们已通过信号初筛，将晋升为「用户维度长期核心记忆」。请为每个候选产出精炼稿：',
+  '你是长期记忆晋升引擎的终审官。输入 JSON：coreTitles 是既有核心记忆标题清单，',
+  'candidates 是一组候选 wiki 主题页（含 title/body 摘录/signals，已通过客观信号初筛）。',
+  '核心层是「任何新会话都会加载的用户维度长期记忆」（容量稀缺，错晋会污染每次会话）。',
+  '逐个候选终审并产出：',
+  '- verdict：promote（长期有效且可反复复用：已拍板口径/用户偏好/稳定规范/长期坑）；',
+  '  reject（不配进核心层：一次性任务产物、时效性数据/分析结果、过程叙述、与 coreTitles 明显重复）；',
+  '  defer（证据不足，下轮再审）；',
+  '- confidence：0-1，对 verdict 的把握（拿不准就给低分，宁缓勿错）；',
+  '- reason：≤40 字的判定理由；',
   '- draftTitle：≤20 字的稳定事实标题（去掉日期/一次性任务措辞）；',
   '- draftBody：≤200 字的持久化表述，只保留长期有效的结论/口径/偏好，剔除过程叙述；',
   '- category：从 user_info/development_code_specification/development_practice_specification/',
   '  project_introduction/project_environment_configuration/common_pitfalls_experience 中选最贴切的一个；',
   '- action：new（独立事实页）/ profile（属于用户画像：身份、偏好、工作方式）。',
-  '严格输出 JSON 数组：[{"sourcePage":"<原 rel>","action":"new|profile","category":"…","draftTitle":"…","draftBody":"…"}]，不要输出其他内容。',
+  '严格输出 JSON 数组：[{"sourcePage":"<原 rel>","verdict":"promote|reject|defer","confidence":0.0,"reason":"…",',
+  '"action":"new|profile","category":"…","draftTitle":"…","draftBody":"…"}]，不要输出其他内容。',
 ].join('\n');
 
 /**
@@ -319,12 +328,15 @@ export async function promoteScan(opts = {}) {
     }
     if (client) {
       try {
-        const payload = top.map((c) => ({
-          sourcePage: c.meta.rel,
-          title: c.meta.title,
-          signals: c.signals,
-          body: c.meta.body.slice(0, 1500),
-        }));
+        const payload = {
+          coreTitles: corePages.map((p) => p.title),
+          candidates: top.map((c) => ({
+            sourcePage: c.meta.rel,
+            title: c.meta.title,
+            signals: c.signals,
+            body: c.meta.body.slice(0, 1500),
+          })),
+        };
         const text = await client.chat(
           [
             { role: 'system', content: SCAN_PROMPT },
@@ -354,6 +366,10 @@ export async function promoteScan(opts = {}) {
       title: c.meta.title,
       score: c.score,
       signals: c.signals,
+      // LLM 终审三元组：启发式降级时统一 defer/0（无终审 = 无自动晋升资格）
+      verdict: ['promote', 'reject', 'defer'].includes(d?.verdict) ? d.verdict : 'defer',
+      confidence: Math.max(0, Math.min(1, Number(d?.confidence) || 0)),
+      reason: String(d?.reason || '').slice(0, 80),
       action: d?.action === 'profile' || d?.action === 'new' ? d.action : h.action,
       targetCorePage: h.action === 'merge' || h.action === 'profile' ? h.targetCorePage : '',
       category: String(d?.category || h.category),
@@ -525,6 +541,57 @@ export function promoteApply(opts = {}) {
     mode: FILE_MODE,
   });
   return { results };
+}
+
+/**
+ * LLM 终审自动晋升（科学晋升机制的执行端，取代人工 apply 把关）。
+ *
+ * 双重门槛 = 客观信号初筛（scorePage ≥ minScore，scan 已完成）
+ *          × LLM 语义终审（verdict=promote 且 confidence ≥ autoConfidence）。
+ * 护栏：
+ * - no LLM, no auto：提名清单非 LLM 精炼产出（冷却/解析失败/启发式降级）时绝不自动写 core；
+ * - 每轮最多 maxAutoPromotePerScan 条（按 信号分×置信度 取最优，防一次灌爆稀缺容量）；
+ * - verdict=reject 记 30 天负样本；defer/低置信度留清单下轮再审；
+ * - 容量上限由 applyNomination 硬约束；自动晋升可随时 hub promote demote 撤销。
+ * @param {{ config?: Object, now?: string }} [opts]
+ * @returns {{ applied: { id: number, sourcePage: string, title: string, file?: string }[],
+ *   rejected: string[], deferred: number, skipped?: string,
+ *   failed: { sourcePage: string, error?: string }[] }}
+ */
+export function promoteAutoApply(opts = {}) {
+  const config = opts.config || loadConfig();
+  const ccfg = config.core || {};
+  if (ccfg.enabled === false || ccfg.autoPromote === false) {
+    return { applied: [], rejected: [], deferred: 0, failed: [], skipped: 'off' };
+  }
+  const noms = loadNominations();
+  if (noms.llm !== 'refined') {
+    // 无 LLM 终审产出：只留提名，不自动拍板
+    return { applied: [], rejected: [], deferred: noms.nominations.length, failed: [], skipped: 'llm-unavailable' };
+  }
+  const minConf = Number.isFinite(ccfg.autoConfidence) ? ccfg.autoConfidence : 0.7;
+  const maxPerScan = Number.isFinite(ccfg.maxAutoPromotePerScan) ? ccfg.maxAutoPromotePerScan : 3;
+
+  // 1) reject → 负样本（30 天抑制）并移出清单
+  const rejectIds = noms.nominations.filter((n) => n.verdict === 'reject').map((n) => n.id);
+  const { rejected } = rejectIds.length > 0 ? promoteReject({ ids: rejectIds, now: opts.now }) : { rejected: [] };
+
+  // 2) promote 且达置信门槛 → 按 分数×置信度 取前 N 条执行
+  const fresh = loadNominations();
+  const eligible = fresh.nominations
+    .filter((n) => n.verdict === 'promote' && Number(n.confidence) >= minConf)
+    .sort((a, b) => b.score * Number(b.confidence) - a.score * Number(a.confidence))
+    .slice(0, maxPerScan);
+  const byId = new Map(eligible.map((n) => [n.id, n]));
+  const { results } = eligible.length > 0
+    ? promoteApply({ ids: eligible.map((n) => n.id), config, now: opts.now })
+    : { results: [] };
+  const applied = results
+    .filter((r) => r.ok)
+    .map((r) => ({ id: r.id, sourcePage: r.sourcePage, title: byId.get(r.id)?.draftTitle || byId.get(r.id)?.title || r.sourcePage, file: r.file }));
+  const failed = results.filter((r) => !r.ok).map((r) => ({ sourcePage: r.sourcePage, error: r.error }));
+  if (applied.length > 0) rebuildMasterIndex();
+  return { applied, rejected, deferred: loadNominations().nominations.length, failed };
 }
 
 /**

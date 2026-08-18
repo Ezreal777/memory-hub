@@ -28,7 +28,7 @@ import { Watcher } from './watcher.js';
 import { distill, llmCooldownRemaining } from './distill.js';
 import { runWriteback, wikiToEntries } from './writeback.js';
 import { compact, compactDue } from './compact.js';
-import { promoteScan, promoteScanDue } from './promote.js';
+import { promoteScan, promoteScanDue, promoteAutoApply } from './promote.js';
 import { primeApiKeyCache } from './keys.js';
 import { appendLogEntry, rotateLogFile } from './util/log.js';
 
@@ -607,6 +607,7 @@ export async function runDaemon(opts = {}) {
   // 晋升提名调度（同 compact 模式：可注入，兜底轮到期触发）
   const promoteScanFn = opts.promoteScanFn || promoteScan;
   const promoteScanDueFn = opts.promoteScanDueFn || promoteScanDue;
+  const promoteAutoApplyFn = opts.promoteAutoApplyFn || promoteAutoApply;
   // 冷却剩余查询（可注入：补跑对齐冷却到期用，测试可伪造）
   const llmCooldownRemainingFn = opts.llmCooldownRemainingFn || llmCooldownRemaining;
 
@@ -738,19 +739,28 @@ export async function runDaemon(opts = {}) {
       }
 
       // 晋升提名（promote scan）：只在兜底/追赶轮且到期（缺省每周）时触发；
-      // 只产出提名清单供用户 hub promote list/apply 确认，不自动写 core 页
+      // scan 后接 LLM 终审自动晋升（双重门槛：信号初筛 × verdict+confidence，
+      // 无 LLM 终审产出时只留提名不拍板；hub promote demote 可随时撤销）
       if (isSweep && promoteScanDueFn(config)) {
         try {
           const p = await promoteScanFn({ config });
           if (!p.ok) {
             round.promote = { ok: false, error: p.error };
             logDaemon('warn', `[${reason}] promote scan 跳过: ${p.error}`);
-          } else if (p.nominated > 0) {
-            round.promote = { ok: true, nominated: p.nominated, llm: p.llm };
-            logDaemon(
-              'info',
-              `[${reason}] promote scan 完成: 扫描 ${p.scanned} 页→提名 ${p.nominated} 条（LLM: ${p.llm}），运行 hub promote list 确认`,
-            );
+          } else {
+            const a = promoteAutoApplyFn({ config });
+            round.promote = { ok: true, nominated: p.nominated, llm: p.llm, autoApplied: a.applied.length, autoRejected: a.rejected.length };
+            if (a.applied.length > 0) {
+              logDaemon(
+                'info',
+                `[${reason}] promote 自动晋升 ${a.applied.length} 条：${a.applied.map((x) => `《${x.title}》`).join(' ')}（拒绝 ${a.rejected.length} / 待定 ${a.deferred}；hub promote demote 可撤销）`,
+              );
+            } else if (p.nominated > 0) {
+              logDaemon(
+                'info',
+                `[${reason}] promote scan 完成: 扫描 ${p.scanned} 页→提名 ${p.nominated} 条（LLM: ${p.llm}），自动晋升 0 条${a.skipped ? `（${a.skipped}）` : `（拒绝 ${a.rejected.length} / 待定 ${a.deferred}）`}`,
+              );
+            }
           }
         } catch (err) {
           round.promote = { ok: false, error: err.message };

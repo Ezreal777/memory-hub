@@ -32,6 +32,7 @@ import {
   promoteScan,
   promoteReject,
   promoteApply,
+  promoteAutoApply,
   loadNominations,
   loadRetentionSignals,
 } from '../src/promote.js';
@@ -405,4 +406,72 @@ test('promoteScan：启发式提名（零 LLM）、minScore 过滤、reject 负�
     now: now + 32 * 24 * 60 * 60 * 1000,
   });
   assert.equal(r4.nominated, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 8. LLM 终审自动晋升（双重门槛 + 护栏）
+// ---------------------------------------------------------------------------
+
+test('promoteAutoApply：verdict+置信度双门槛、每轮限额、reject 负样本、无 LLM 不拍板', async () => {
+  freshHubRoot();
+  const now = Date.parse('2026-09-01T00:00:00Z');
+  const sources = ['/h/Memory Hub/sources/claude/a.md', '/h/Memory Hub/sources/qoder/b.md'];
+  writeWikiPage('fact-a', { hubIds: ['hub-a1'], title: '口径A（已拍板）', body: '用户确认的长期口径A。', sources });
+  writeWikiPage('fact-b', { hubIds: ['hub-b1'], title: '口径B（已拍板）', body: '用户确认的长期口径B。', sources });
+  writeWikiPage('transient', { hubIds: ['hub-t1'], title: '一次性分析（已拍板）', body: '用户确认的一次性分析。', sources });
+  writeWikiPage('unsure', { hubIds: ['hub-u1'], title: '拿不准（已拍板）', body: '用户确认但证据不足。', sources });
+  const retention = {
+    firstSeen: new Map([
+      ['hub-a1', '2026-08-01T00:00:00Z'],
+      ['hub-b1', '2026-08-01T00:00:00Z'],
+      ['hub-t1', '2026-08-01T00:00:00Z'],
+      ['hub-u1', '2026-08-01T00:00:00Z'],
+    ]),
+    removedCount: new Map(),
+    snapshots: 2,
+  };
+  // 终审 mock：A/B 高置信 promote、transient reject、unsure 低置信 promote
+  const judgeClient = {
+    chat: async () =>
+      JSON.stringify([
+        { sourcePage: 'fact-a.md', verdict: 'promote', confidence: 0.95, reason: '长期口径', action: 'new', category: 'development_code_specification', draftTitle: '口径A', draftBody: '长期口径A。' },
+        { sourcePage: 'fact-b.md', verdict: 'promote', confidence: 0.8, reason: '长期口径', action: 'new', category: 'development_code_specification', draftTitle: '口径B', draftBody: '长期口径B。' },
+        { sourcePage: 'transient.md', verdict: 'reject', confidence: 0.9, reason: '时效性分析', action: 'new', category: 'project_introduction', draftTitle: 'x', draftBody: 'x' },
+        { sourcePage: 'unsure.md', verdict: 'promote', confidence: 0.4, reason: '证据不足', action: 'new', category: 'project_introduction', draftTitle: 'y', draftBody: 'y' },
+      ]),
+  };
+  const config = { core: coreConfig({ minScore: 3, autoPromote: true, autoConfidence: 0.7, maxAutoPromotePerScan: 1 }), llm: {} };
+
+  const r = await promoteScan({ config, retention, probePages: new Set(), now, client: judgeClient });
+  assert.ok(r.ok);
+  assert.equal(r.llm, 'refined');
+
+  // 每轮限额 1：只晋升 分数×置信度 最高的 fact-a；transient 被拒记负样本；
+  // fact-b（达标但超限额）与 unsure（低置信）留清单待定
+  const a1 = promoteAutoApply({ config, now: new Date(now).toISOString() });
+  assert.equal(a1.applied.length, 1);
+  assert.equal(a1.applied[0].sourcePage, 'fact-a.md');
+  assert.deepEqual(a1.rejected, ['transient.md']);
+  assert.equal(a1.deferred, 2, 'fact-b 与 unsure 留待下轮');
+  assert.equal(listCorePages().length, 1);
+
+  // 下一轮：fact-b 补晋；transient 在 30 天抑制期内不再提名
+  const r2 = await promoteScan({ config, retention, probePages: new Set(), now: now + 1000, client: judgeClient });
+  assert.ok(!loadNominations().nominations.some((n) => n.sourcePage === 'transient.md'), 'reject 负样本抑制');
+  const a2 = promoteAutoApply({ config, now: new Date(now + 1000).toISOString() });
+  assert.equal(a2.applied.length, 1);
+  assert.equal(a2.applied[0].sourcePage, 'fact-b.md');
+  assert.equal(listCorePages().length, 2);
+
+  // no LLM, no auto：启发式降级（无 client + 伪造冷却不可用路径下 llm=skipped）绝不自动写 core
+  const r3 = await promoteScan({ config, retention, probePages: new Set(), now: now + 2000 });
+  assert.notEqual(loadNominations().llm, 'refined');
+  const a3 = promoteAutoApply({ config });
+  assert.equal(a3.applied.length, 0);
+  assert.equal(a3.skipped, 'llm-unavailable');
+  assert.equal(listCorePages().length, 2, '启发式提名无自动晋升资格');
+
+  // autoPromote=false：回退人工把关
+  const off = promoteAutoApply({ config: { core: coreConfig({ autoPromote: false }) } });
+  assert.equal(off.skipped, 'off');
 });

@@ -62,8 +62,8 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `hub writeback` | wiki 条目并行写回各 App（`--app` / `--entry` / `--dry-run` / `--from-sources` / `--force-batch3`）；默认增量：消费 `state/pending-writeback.json` 只写回其中列出的页面，全部成功后原子清空，清单缺失/为空时降级全量并记日志；增量轮次无条件重申 core 条目（被清即复活）；`--core-only` 只刷核心层；`--full` 强制全量广播；`--repair` 修复 codex AGENTS.md 多标记区（见下） |
 | `hub doctor` | 健康度体检（纯只读，✅/⚠️/❌ 分级；`--json` 结构化输出；有 ❌ 时退出码非零） |
 | `hub search <关键词…>` | wiki 全文检索（grep 级；多关键词 AND，大小写不敏感；`--limit <n>` 缺省 20） |
-| `hub promote scan/list/apply/reject` | 晋升管道：四信号打分（跨源/存活/探针/拍板）产提名 → 人工 `apply` 确认后写入 wiki/core/ 长期核心层；`reject` 记负样本 30 天抑制；daemon 每周自动扫描提名（只提名不自动写） |
-| `hub promote add/demote` | 手动晋升指定主题页（`--to user-profile` 并入用户画像页）/ 核心页降回 wiki 顶层 |
+| `hub promote scan/list/apply/reject` | 晋升管道：四信号打分（跨源/存活/探针/拍板）初筛 + LLM 终审（verdict/confidence/reason，对照既有 core 判重），达标自动晋升 wiki/core/（每轮限额，无 LLM 终审不拍板；`--no-auto` 回退人工 apply 把关）；reject 记负样本 30 天抑制；daemon 每周自动扫描 |
+| `hub promote add/demote` | 手动晋升指定主题页（`--to user-profile` 并入用户画像页）/ 核心页降回 wiki 顶层（自动晋升的撤销通道） |
 | `hub core` | 核心层状态：容量水位（上限 50）、每页 category/来源/最近写回记录 |
 | `hub eval generate/coverage/report` | 记忆效果评测：LLM 从 wiki 抽样生成事实探针题 / 各 App 记忆语料可达性检测 / 三层评测总报告 |
 | `hub tombstone list` | 列出全部删除登记（三态：待 wiki 标记 / 待写回清理 / 已闭环，含 suspectedStorm 风暴标记） |
@@ -105,7 +105,8 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `llm.keyRef` | Keychain 密钥引用名（密钥本体只在 Keychain，绝不落盘） |
 | `llm.hourlyCallCap` / `llm.dailyCallCap` | LLM 调用预算刹车（缺省 0 = 不启用）：hub 自身每小时/每日调用上限（含失败调用，网关同样计数），给同一 AK 的交互使用留余量。超额自动暂停（小时预算 → 暂停 1 小时；日预算 → 暂停到本地次日凌晨）。台账在 `state/llm-usage.json`，仅真实网关调用记账。示例：免费档 10 次/时 + 200 次/天 可配 `8` / `150` |
 | `core.enabled` / `core.reassertEveryRound` | 长期核心层（wiki/core/）总开关与每轮重申开关（缺省均 `true`：增量写回无条件重申 core 条目，App 侧被清后自动复活） |
-| `core.maxEntries` / `core.survivalDays` / `core.minScore` / `core.scanIntervalMs` | 核心层容量上限（缺省 50）/ 晋升存活信号天数（缺省 15）/ 提名最低信号分（缺省 3）/ daemon 自动扫描提名间隔（缺省 7 天；只产提名，`hub promote apply` 确认后才写 core） |
+| `core.maxEntries` / `core.survivalDays` / `core.minScore` / `core.scanIntervalMs` | 核心层容量上限（缺省 50）/ 晋升存活信号天数（缺省 15）/ 提名最低信号分（缺省 3）/ daemon 自动扫描间隔（缺省 7 天） |
+| `core.autoPromote` / `core.autoConfidence` / `core.maxAutoPromotePerScan` | LLM 终审自动晋升（缺省 `true`）：verdict=promote 且置信度 ≥ 门槛（缺省 0.7）才自动写 core，每轮最多 N 条（缺省 3）；无 LLM 终审产出（冷却/降级）只提名不拍板；`hub promote demote` 可撤销，`false` 回退人工 apply 把关 |
 
 数据根目录缺省 `~/.memory-hub`，可用环境变量 **`MEMORY_HUB_ROOT`** 覆盖；
 用户可视目录缺省 `~/Desktop/Memory Hub`，可用 **`MEMORY_HUB_USER_ROOT`** 覆盖
