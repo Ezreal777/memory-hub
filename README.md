@@ -59,9 +59,13 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `hub index` | 全量重建 `_index/master-index.md`（收录全部页面、头部计数用实际值、逐行回填页面 frontmatter 的 hub-id） |
 | `hub distill` | LLM 整理 sources → wiki（`--dry-run` / `--max-pages <n>`）；批内内容去重 / 测试标记快照过滤 / 相似主题优先并入既有页，每轮成功后自动重建主索引并登记 `state/pending-writeback.json` 增量写回清单 |
 | `hub compact` | wiki 全局归并：同主题近似页簇用 LLM 归并为少数页（`--dry-run` 只出聚类计划 / `--topic <key>` 定向试点 / `--max-clusters <n>`）；输家页备份后删除，赢家页登记增量写回、输家页主 hubId 登记 removals 由写回侧清理 App 侧旧渲染；到期后 daemon 兜底轮自动执行（见 config.compact） |
-| `hub writeback` | wiki 条目并行写回各 App（`--app` / `--entry` / `--dry-run` / `--from-sources` / `--force-batch3`）；默认增量：消费 `state/pending-writeback.json` 只写回其中列出的页面，全部成功后原子清空，清单缺失/为空时降级全量并记日志；`--full` 强制全量广播；`--repair` 修复 codex AGENTS.md 多标记区（见下） |
+| `hub writeback` | wiki 条目并行写回各 App（`--app` / `--entry` / `--dry-run` / `--from-sources` / `--force-batch3`）；默认增量：消费 `state/pending-writeback.json` 只写回其中列出的页面，全部成功后原子清空，清单缺失/为空时降级全量并记日志；增量轮次无条件重申 core 条目（被清即复活）；`--core-only` 只刷核心层；`--full` 强制全量广播；`--repair` 修复 codex AGENTS.md 多标记区（见下） |
 | `hub doctor` | 健康度体检（纯只读，✅/⚠️/❌ 分级；`--json` 结构化输出；有 ❌ 时退出码非零） |
 | `hub search <关键词…>` | wiki 全文检索（grep 级；多关键词 AND，大小写不敏感；`--limit <n>` 缺省 20） |
+| `hub promote scan/list/apply/reject` | 晋升管道：四信号打分（跨源/存活/探针/拍板）产提名 → 人工 `apply` 确认后写入 wiki/core/ 长期核心层；`reject` 记负样本 30 天抑制；daemon 每周自动扫描提名（只提名不自动写） |
+| `hub promote add/demote` | 手动晋升指定主题页（`--to user-profile` 并入用户画像页）/ 核心页降回 wiki 顶层 |
+| `hub core` | 核心层状态：容量水位（上限 50）、每页 category/来源/最近写回记录 |
+| `hub eval generate/coverage/report` | 记忆效果评测：LLM 从 wiki 抽样生成事实探针题 / 各 App 记忆语料可达性检测 / 三层评测总报告 |
 | `hub tombstone list` | 列出全部删除登记（三态：待 wiki 标记 / 待写回清理 / 已闭环，含 suspectedStorm 风暴标记） |
 | `hub tombstone apply` | 显式执行删除传播（含 suspectedStorm 条目；`--dry-run` 只预览影响面，执行前打印影响面并需 `--yes` 确认） |
 | `hub tombstone drop <hubId>` | 撤销误登记的 tombstone（`--all-storm` 批量撤销全部风暴标记条目） |
