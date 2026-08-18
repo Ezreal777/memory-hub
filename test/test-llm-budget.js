@@ -109,9 +109,55 @@ test('llmClient：400+IRC-001 与 429 判定 rateLimited 且不重试', async ()
   assert.equal(fetch500.calls.length, 3, '5xx 按退避重试 2 次');
 });
 
+test('llmClient：响应体永久挂起 → 总超时预算内报 retryable 超时（M9 防 pipeline 冻结）', async () => {
+  // 复现场景：拿到响应头后连接中途死掉（TCP CLOSED），resp.json() 永不 resolve；
+  // 修复前超时定时器在响应头到达即被清除，daemon 整条 pipeline 曾永久冻结
+  const hangFetch = async () => ({
+    ok: true,
+    json: () => new Promise(() => {}), // 永久挂起的响应体
+  });
+  const client = createLlmClient({
+    baseUrl: 'https://x/v1',
+    model: 'm',
+    apiKey: 'k',
+    fetchImpl: hangFetch,
+    timeoutMs: 120, // 小预算加速测试
+    retryDelaysMs: [1],
+  });
+  const t0 = Date.now();
+  await assert.rejects(
+    () => client.chat([{ role: 'user', content: 'x' }]),
+    (err) => err.retryable === true && /响应体读取超时/.test(err.message),
+  );
+  assert.ok(Date.now() - t0 < 5000, '在总超时预算量级内返回，绝不永久挂起');
+
+  // 错误响应的 body 挂起同样受保护（降级为“响应体不可读”，按 status 判定重试语义）
+  const hangErrFetch = async () => ({
+    ok: false,
+    status: 500,
+    text: () => new Promise(() => {}),
+  });
+  const client2 = createLlmClient({
+    baseUrl: 'https://x/v1',
+    model: 'm',
+    apiKey: 'k',
+    fetchImpl: hangErrFetch,
+    timeoutMs: 120,
+    retryDelaysMs: [],
+  });
+  await assert.rejects(
+    () => client2.chat([{ role: 'user', content: 'x' }]),
+    (err) => /HTTP 500/.test(err.message) && /不可读/.test(err.message),
+  );
+});
+
 test('startLlmCooldown：小时限流冷却 60 分钟，日额度耗尽冷却到次日凌晨，不回退更晚冷却', () => {
   freshHubRoot();
-  const now = Date.now();
+  // 固定到本地正午：若用 Date.now()，23 点后运行时“小时冷却（now+60min）”会晚于
+  // “次日凌晨”，断言必挂（时间依赖型 flaky，实测踩中）
+  const base = new Date();
+  base.setHours(12, 0, 0, 0);
+  const now = base.getTime();
   startLlmCooldown('抱歉，您当前调用的API超过了10次/60.0分钟，请下一个周期再试。', now);
   const c1 = llmCooldownRemaining(now);
   assert.ok(c1.remainMs > 0 && c1.remainMs <= LLM_COOLDOWN_MS, '小时限流冷却 ≤60 分钟');

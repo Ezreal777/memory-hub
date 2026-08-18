@@ -102,7 +102,25 @@ export function createLlmClient(opts = {}) {
       recordLlmCall(); // 每次真实发请求前登记（含重试的每次尝试——网关同样计数）
     }
     const controller = new AbortController();
+    const startedAt = Date.now();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // M9：响应体读取也必须在总超时预算内——实测连接中途死掉（TCP 已 CLOSED）时
+    // resp.json() 会永久挂起，daemon 整条 pipeline 冻结；用剩余预算竞速 + abort 兜底，
+    // 超时抛 retryable（不依赖 fetch 实现对 signal 的响应，mock 同样受保护）
+    const readBody = (promise, what) => {
+      const remainMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+      let bodyTimer;
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          bodyTimer = setTimeout(() => {
+            controller.abort();
+            reject(new LlmError(`LLM ${what}超时（总预算 ${timeoutMs}ms）`, { retryable: true }));
+          }, remainMs);
+          if (bodyTimer.unref) bodyTimer.unref();
+        }),
+      ]).finally(() => clearTimeout(bodyTimer));
+    };
     let resp;
     try {
       resp = await doFetch(endpoint, {
@@ -120,43 +138,47 @@ export function createLlmClient(opts = {}) {
         }),
       });
     } catch (err) {
+      clearTimeout(timer);
       const reason = err?.name === 'AbortError' ? `超时（${timeoutMs}ms）` : err.message;
       // 网络错误/超时：瞬时故障概率高，标记可重试
       throw new LlmError(`LLM 请求失败（${endpoint}）: ${reason}`, { retryable: true });
+    }
+    // 注意：不能在拿到响应头就 clearTimeout——body 仍在传输，后续读取继续受总超时保护
+    try {
+      if (!resp.ok) {
+        // 只截取响应体前 300 字符用于诊断，绝不回显请求头（含密钥）
+        let snippet = '';
+        try {
+          snippet = (await readBody(resp.text(), '错误响应体读取')).slice(0, 300);
+        } catch {
+          snippet = '(响应体不可读)';
+        }
+        const status = Number(resp.status);
+        // M5：请求体超网关上限（413 或响应体含 TooLarge）→ 上层拆分批次，重试无意义
+        const tooLarge = status === 413 || /TooLarge|too\s*large/i.test(snippet);
+        // 配额/频次限流：标准 429，或 idealab 网关的 400+IRC-001（小时限流/日额度耗尽）。
+        // 关键事实：失败调用照样计入日额度，因此不重试、上层整轮刹车进入冷却
+        const rateLimited =
+          status === 429 || (status === 400 && /IRC-001|超过了\s*\d+\s*次|请下一个周期|请明天再来/.test(snippet));
+        const retryable = !tooLarge && !rateLimited && status >= 500;
+        throw new LlmError(`LLM 返回 HTTP ${status}: ${snippet}`, { status, retryable, tooLarge, rateLimited });
+      }
+
+      let data;
+      try {
+        data = await readBody(resp.json(), '响应体读取');
+      } catch (err) {
+        if (err instanceof LlmError) throw err; // body 超时：保留 retryable 语义
+        throw new LlmError(`LLM 响应不是合法 JSON: ${err.message}`);
+      }
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string') {
+        throw new LlmError('LLM 响应缺少 choices[0].message.content');
+      }
+      return content;
     } finally {
       clearTimeout(timer);
     }
-
-    if (!resp.ok) {
-      // 只截取响应体前 300 字符用于诊断，绝不回显请求头（含密钥）
-      let snippet = '';
-      try {
-        snippet = (await resp.text()).slice(0, 300);
-      } catch {
-        snippet = '(响应体不可读)';
-      }
-      const status = Number(resp.status);
-      // M5：请求体超网关上限（413 或响应体含 TooLarge）→ 上层拆分批次，重试无意义
-      const tooLarge = status === 413 || /TooLarge|too\s*large/i.test(snippet);
-      // 配额/频次限流：标准 429，或 idealab 网关的 400+IRC-001（小时限流/日额度耗尽）。
-      // 关键事实：失败调用照样计入日额度，因此不重试、上层整轮刹车进入冷却
-      const rateLimited =
-        status === 429 || (status === 400 && /IRC-001|超过了\s*\d+\s*次|请下一个周期|请明天再来/.test(snippet));
-      const retryable = !tooLarge && !rateLimited && status >= 500;
-      throw new LlmError(`LLM 返回 HTTP ${status}: ${snippet}`, { status, retryable, tooLarge, rateLimited });
-    }
-
-    let data;
-    try {
-      data = await resp.json();
-    } catch (err) {
-      throw new LlmError(`LLM 响应不是合法 JSON: ${err.message}`);
-    }
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string') {
-      throw new LlmError('LLM 响应缺少 choices[0].message.content');
-    }
-    return content;
   }
 
   /**
