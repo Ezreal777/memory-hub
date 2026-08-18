@@ -25,7 +25,7 @@ import { paths, ensureHubDirs, ensureDir, FILE_MODE } from './util/paths.js';
 import { atomicWrite } from './safe-write.js';
 import { loadConfig, defaultConfig } from './config.js';
 import { Watcher } from './watcher.js';
-import { distill } from './distill.js';
+import { distill, llmCooldownRemaining } from './distill.js';
 import { runWriteback, wikiToEntries } from './writeback.js';
 import { compact, compactDue } from './compact.js';
 import { promoteScan, promoteScanDue } from './promote.js';
@@ -607,6 +607,8 @@ export async function runDaemon(opts = {}) {
   // 晋升提名调度（同 compact 模式：可注入，兜底轮到期触发）
   const promoteScanFn = opts.promoteScanFn || promoteScan;
   const promoteScanDueFn = opts.promoteScanDueFn || promoteScanDue;
+  // 冷却剩余查询（可注入：补跑对齐冷却到期用，测试可伪造）
+  const llmCooldownRemainingFn = opts.llmCooldownRemainingFn || llmCooldownRemaining;
 
   logDaemon(
     'info',
@@ -640,6 +642,7 @@ export async function runDaemon(opts = {}) {
   let quietTimer = null;
   let deadlineTimer = null;
   let startupTimer = null;
+  let rerunTimer = null; // 补跑定时器（单一引用，重复排期时取最新，防叠加）
   let pipelineBusy = false;
   let pipelineRerun = false;
 
@@ -775,12 +778,21 @@ export async function runDaemon(opts = {}) {
       health.lastRound = round;
       saveHealth();
       pipelineBusy = false;
-      if (pipelineRerun || (hasBacklog && !stopping)) {
-        // 积压未清（如停机欠账首次追赶）或运行期间又有触发：稍作喘息后续跑，
-        // 直到清底，不等下一个兜底扫描
+      const cdMs = stopping ? 0 : llmCooldownRemainingFn().remainMs;
+      if (!stopping && (pipelineRerun || hasBacklog || cdMs > 0)) {
+        // 积压未清/运行期间又有触发：稍作喘息后续跑，直到清底；
+        // 冷却激活时对齐到期时刻续跑（+15s 缓冲）——此前固定 5s 补跑必撞冷却，
+        // 之后干等下个整点兜底轮又落在冷却期内被跳过，实测节奏退化为每 2 小时
+        // 一轮（半速）；冷却中无积压也排一次续跑（pending=0 时零成本空转一次）
         pipelineRerun = false;
-        const t = setTimeout(() => runPipeline('补跑'), 5000);
-        if (t.unref) t.unref();
+        if (rerunTimer) clearTimeout(rerunTimer);
+        const rerunDelayMs = cdMs > 0 ? cdMs + 15000 : 5000;
+        logDaemon('info', `[${reason}] 补跑已排期：${Math.round(rerunDelayMs / 1000)}s 后（${cdMs > 0 ? '对齐冷却到期' : '积压续跑'}）`);
+        rerunTimer = setTimeout(() => {
+          rerunTimer = null;
+          runPipeline('补跑');
+        }, rerunDelayMs);
+        if (rerunTimer.unref) rerunTimer.unref();
       }
     }
   }
@@ -848,6 +860,7 @@ export async function runDaemon(opts = {}) {
     clearInterval(sweepTimer);
     clearTriggerTimers();
     if (startupTimer) clearTimeout(startupTimer);
+    if (rerunTimer) clearTimeout(rerunTimer);
     if (degradedTimer) clearInterval(degradedTimer);
     try {
       await watcher.stop();
