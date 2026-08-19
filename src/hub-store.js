@@ -60,6 +60,10 @@ export const storePaths = {
   get tombstones() {
     return path.join(paths.state, 'tombstones.json');
   },
+  /** 摄取内容指纹表 ~/.memory-hub/state/source-fingerprints.json（同 app 同内容只进一次 sources） */
+  get sourceFingerprints() {
+    return path.join(paths.state, 'source-fingerprints.json');
+  },
 };
 
 /** wiki 层占位说明（首次初始化时写入） */
@@ -369,6 +373,13 @@ export function ingest(adapter, entry, opts = {}) {
   const dir = path.join(storePaths.sources, appId);
   ensureDir(dir);
 
+  // 回声保底：同 app 同内容指纹已登记 → 不再落盘（调用方按 deduped 计数）
+  const fps = loadFingerprints();
+  const fpKey = `${appId}:${contentFingerprint(appId, entry)}`;
+  if (fps.fps[fpKey]) {
+    return { hubId: fps.fps[fpKey], snapshotPath: null, deduped: true };
+  }
+
   const slug = slugify(entry.title || path.basename(entry.file || 'entry'));
   const snapshotPath = path.join(dir, `${snapshotTimestamp()}-${slug}.md`);
   const content = renderSnapshot(hubId, appId, entry);
@@ -381,6 +392,8 @@ export function ingest(adapter, entry, opts = {}) {
     n += 1;
   }
   atomicWrite(target, content, { mode: FILE_MODE });
+  fps.fps[fpKey] = hubId;
+  saveFingerprints(fps);
 
   // 删除传播：同源路径重新出现内容 = 用户重建了记忆 → 解除该源文件的 tombstone
   if (fs.existsSync(tombstonesPath())) {
@@ -439,6 +452,33 @@ function yamlScalar(v) {
 /** hub 写回渲染标记：正文中的 [hub-YYYYMMDDHHMMSS-xxxxxx]（genHubId 格式） */
 export const ECHO_MARKER_RE = /\[hub-\d{14}-[a-z0-9]{6}\]/;
 
+/** 巨文件摄取上限：超过此尺寸的源文件拒摄取（防同步读取+切节把事件循环拖死） */
+export const MAX_INGEST_FILE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 摄取内容指纹（echo-storm 2026-08-19 保底防线）：sha256(app \n title \n body)。
+ * 同一 app 下同标题同正文的条目无论被 parse 多少次，sources 层只落一份快照——
+ * 防止任何全量重摄取（写回回声/配置失误）把只增不改的快照层撑爆
+ * （回声雪球单日灌入 3.5 万份重复快照/464MB）。
+ */
+function contentFingerprint(appId, entry) {
+  return sha256Of(`${appId}\n${String(entry.title || '')}\n${String(entry.body || '').trim()}`);
+}
+
+function loadFingerprints() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(storePaths.sourceFingerprints, 'utf8'));
+    if (raw && typeof raw === 'object' && raw.fps && typeof raw.fps === 'object') return raw;
+  } catch {
+    // 损坏/缺失视为空表，首次摄取时重建
+  }
+  return { version: 1, fps: {} };
+}
+
+function saveFingerprints(state) {
+  atomicWrite(storePaths.sourceFingerprints, JSON.stringify(state), { mode: FILE_MODE });
+}
+
 /**
  * 判定一条解析出的记忆条目是否为 hub 自己写回的渲染产物（回声）。
  * 背景：inflight 回环抑制只认「路径+hash」，App 客户端重组目录（qoder 跨
@@ -475,8 +515,23 @@ export function harvest(adapter) {
   let ingested = 0;
   let bytes = 0;
   let echoSkipped = 0;
+  let deduped = 0;
+  let bigSkipped = 0;
   for (const filePath of targets) {
-    const raw = adapter.read(filePath);
+    // 巨文件防护（echo-storm 2026-08-19）：先 stat 后读——超限不读全文不切节，
+    // 记 size 指纹防重判（文件缩回正常后 mtime/size 变化自然重新摄取）
+    let raw = null;
+    try {
+      const st = fs.statSync(filePath);
+      if (st.size > MAX_INGEST_FILE_BYTES) {
+        recordFile(filePath, `bigskip:${st.size}:${st.mtimeMs}`, st.mtimeMs, adapter.id);
+        bigSkipped += 1;
+        continue;
+      }
+    } catch {
+      // stat 失败（并发删除等）交给 read 兜底
+    }
+    raw = adapter.read(filePath);
     if (!raw) continue;
     // 跨进程回环抑制（Bug#3）：其他进程（CLI 写回）刚写入的内容，
     // 命中 inflight.json 登记（路径 + hash）则只记对账指纹、不摄取，避免自写内容重复进 sources。
@@ -497,9 +552,13 @@ export function harvest(adapter) {
         echoSkipped += 1;
         continue;
       }
-      ingest(adapter, entry, { recordState: false });
-      ingested += 1;
-      bytes += String(entry.body || '').length;
+      const r = ingest(adapter, entry, { recordState: false });
+      if (r && r.deduped) {
+        deduped += 1;
+      } else {
+        ingested += 1;
+        bytes += String(entry.body || '').length;
+      }
     }
     // 无论是否产出条目，都在文件级记录一次指纹（0 条目的跳过文件也记，避免反复重判）
     recordFile(filePath, raw.sha256, raw.mtimeMs, adapter.id);
@@ -507,7 +566,7 @@ export function harvest(adapter) {
   for (const p of removed) {
     removeFileState(p);
   }
-  return { ingested, files: targets.length, removed: removed.length, bytes, echoSkipped };
+  return { ingested, files: targets.length, removed: removed.length, bytes, echoSkipped, deduped, bigSkipped };
 }
 
 // ---------------------------------------------------------------------------

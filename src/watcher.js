@@ -31,6 +31,7 @@ import {
   addTombstonesGuarded,
   findSnapshotHubIdsBySource,
   isEchoEntry,
+  MAX_INGEST_FILE_BYTES,
 } from './hub-store.js';
 import { consumeInflight, loadInflightEntries, loadDirWindows } from './inflight.js';
 import { appendLogEntry } from './util/log.js';
@@ -285,6 +286,19 @@ export class Watcher {
     if (!adapter.isIngestible(filePath)) {
       logWatcher(adapter.id, filePath, 'skip 非白名单文件，丢弃');
       return;
+    }
+
+    // 巨文件防护（echo-storm 2026-08-19）：超限文件不读全文不切节，
+    // 记 size 指纹防重判（文件缩回正常后 mtime/size 变化自然重新摄取）
+    try {
+      const st = fs.statSync(filePath);
+      if (st.size > MAX_INGEST_FILE_BYTES) {
+        recordFile(filePath, `bigskip:${st.size}:${st.mtimeMs}`, st.mtimeMs, adapter.id);
+        logWatcher(adapter.id, filePath, `skip 巨文件 ${Math.round(st.size / 1024)}KB 超摄取上限，跳过`);
+        return;
+      }
+    } catch {
+      // stat 失败走原路径（readFileMeta 会兜底返回 null）
     }
 
     const meta = readFileMeta(filePath);

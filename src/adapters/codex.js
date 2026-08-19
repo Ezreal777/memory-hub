@@ -406,6 +406,9 @@ export function splitH2Sections(content) {
   return result;
 }
 
+/** 自尾部保留最多 n 个（n≤0 空集）。注：不可用 slice(-n)——n=0 时 slice(-0)=全量 */
+const capTail = (arr, n) => (n <= 0 ? [] : arr.length > n ? arr.slice(-n) : arr);
+
 export class CodexAdapter extends BaseAdapter {
   /** memory_paths 本身即 AGENTS.md 文件路径（工作区级，可能多个） */
   watchPaths() {
@@ -424,7 +427,12 @@ export class CodexAdapter extends BaseAdapter {
   }
 
   parse(raw) {
-    const sections = splitH2Sections(raw.content);
+    // 回声断根（echo-storm 2026-08-19）：只摄取标记区外的用户/CLI 原生内容。
+    // 区内是 hub 写回的条目——wiki 页正文自带 H2 结构，曾按全文切节导致
+    // 写回 → 全量重摄取 → 蒸馏 → 再写回的指数雪球（单文件滚到 11MB/1.3 万 H2）。
+    // 无标记区的纯用户文件行为不变（before=全文）。
+    const { before, after } = splitHubRegion(raw.content);
+    const sections = splitH2Sections(`${before}\n${after}`);
     return sections.map((sec) =>
       makeEntry({
         app: this.id,
@@ -441,6 +449,16 @@ export class CodexAdapter extends BaseAdapter {
   // =========================================================================
   // 写回侧（batch:1 —— 低风险批次：直接加载型，写入后新会话即生效）
   // =========================================================================
+
+  /**
+   * 标记区条目上限（echo-storm 2026-08-19）：AGENTS.md 是 Codex CLI 每次会话
+   * 加载的配置文件，全量写回会把它滚成巨无霸（实测 11MB/1.2 万块）。
+   * config.apps[].maxRegionEntries 可覆盖，默认 120。
+   */
+  get maxRegionEntries() {
+    const n = Number(this.app.maxRegionEntries);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 120;
+  }
 
   /**
    * 渲染单条区内块：`### 标题 [hub-id]` + 正文。
@@ -472,8 +490,31 @@ export class CodexAdapter extends BaseAdapter {
     for (const entry of entries) {
       blockMap.set(entry.hubId, this.render(entry));
     }
-    const regionBody = [...blockMap.values()].join('\n\n');
-    const regionText = `${HUB_MARK_START}\n${regionBody}\n${HUB_MARK_END}`;
+    // 条目硬上限（echo-storm 2026-08-19）：合并后按三档优先裁到 maxEntries——
+    // core 条目（每轮重申，永不淘汰）＞本轮写入 ＞旧块（各档内保最新、淘汰最旧）。
+    // 写回引擎每轮传全量 wiki 条目，仅裁旧块挡不住全量轮，必须对终态硬限。
+    const maxEntries = this.maxRegionEntries;
+    const coreIds = new Set(entries.filter((e) => e.tier === 'core').map((e) => e.hubId));
+    const keepIds = new Set(entries.map((e) => e.hubId));
+    const freshCore = [];
+    const freshNorm = [];
+    const staleAll = [];
+    for (const [hubId, text] of blockMap) {
+      if (coreIds.has(hubId)) freshCore.push(text);
+      else if (keepIds.has(hubId)) freshNorm.push(text);
+      else staleAll.push(text);
+    }
+    const cap = capTail;
+    const keptCore = cap(freshCore, maxEntries);
+    const keptFresh = cap(freshNorm, Math.max(0, maxEntries - keptCore.length));
+    const keptOld = cap(staleAll, Math.max(0, maxEntries - keptCore.length - keptFresh.length));
+    const truncated = blockMap.size - keptCore.length - keptFresh.length - keptOld.length;
+    const regionBody = [...keptOld, ...keptCore, ...keptFresh].join('\n\n');
+    const truncNote =
+      truncated > 0
+        ? `\n\n<!-- memory-hub: 标记区已达 ${maxEntries} 条上限，本轮淘汰 ${truncated} 条最旧记忆，完整内容见 Memory Hub wiki/ -->`
+        : '';
+    const regionText = `${HUB_MARK_START}\n${regionBody}${truncNote}\n${HUB_MARK_END}`;
     if (region === null) {
       // 区不存在 → 文末追加创建（Bug#6 修复：区外内容逐字节原样保留，
       // 不多补空行；仅当原文末尾无换行时补一个换行分隔）
@@ -491,14 +532,41 @@ export class CodexAdapter extends BaseAdapter {
    * @returns {Promise<Object[]>} 逐目标结果
    */
   async write(entries) {
+    // 条目硬上限（echo-storm 2026-08-19）：先限量再写——本轮实际写入集 =
+    // core 全保（≤max）+ 普通条目自新向旧补足剩余配额；被限掉的条目记
+    // skipped（写后校验只认实际写入集，两者永远一致）。
+    // AGENTS.md 是 Codex CLI 每次会话加载的配置文件，全量写回曾把它滚成
+    // 11MB/1.2 万块，进而引发回声雪球。
+    const maxEntries = this.maxRegionEntries;
+    let toWrite = entries;
+    if (entries.length > maxEntries) {
+      const core = entries.filter((e) => e.tier === 'core');
+      const norm = entries.filter((e) => e.tier !== 'core');
+      const keptCore = capTail(core, maxEntries);
+      const quota = Math.max(0, maxEntries - keptCore.length);
+      const keptNorm = quota === 0 ? [] : norm.slice(-quota);
+      // quota>0 时 slice(-quota) 安全；quota=0 归空集
+      toWrite = [...keptCore, ...keptNorm];
+    }
     const results = [];
+    const keptIds = new Set(toWrite.map((e) => e.hubId));
+    for (const e of entries) {
+      if (!keptIds.has(e.hubId)) {
+        results.push({
+          hubId: e.hubId,
+          status: 'skipped',
+          targets: this.memoryPaths,
+          reason: `标记区容量上限 ${maxEntries} 条（完整内容见 Memory Hub wiki/）`,
+        });
+      }
+    }
     for (const agentsPath of this.memoryPaths) {
       const preStat = statSafe(agentsPath); // H2b：读取时 stat 守卫基准
       const original = fs.existsSync(agentsPath) ? fs.readFileSync(agentsPath, 'utf8') : '';
-      const merged = this.buildMergedContent(original, entries);
+      const merged = this.buildMergedContent(original, toWrite);
       if (merged === original) {
         results.push({
-          hubId: entries.map((e) => e.hubId).join(','),
+          hubId: toWrite.map((e) => e.hubId).join(','),
           status: 'skipped',
           targets: [agentsPath],
           reason: '标记区内容无变化',
@@ -511,19 +579,19 @@ export class CodexAdapter extends BaseAdapter {
             path: agentsPath,
             content: merged,
             verifyOpts: {
-              expectMarker: [HUB_MARK_START, HUB_MARK_END, ...entries.map((e) => `[${e.hubId}]`)],
+              expectMarker: [HUB_MARK_START, HUB_MARK_END, ...toWrite.map((e) => `[${e.hubId}]`)],
             },
             app: this.id,
             preStat,
           },
         ]);
-        for (const entry of entries) {
+        for (const entry of toWrite) {
           results.push({ hubId: entry.hubId, status: 'written', targets: [agentsPath], backupDir });
         }
       } catch (err) {
         if (err.deferred) {
           // H2b：读-写间隙被 App/用户追加过内容 → 放弃本轮，下轮基于新内容重合并
-          for (const entry of entries) {
+          for (const entry of toWrite) {
             results.push({ hubId: entry.hubId, status: 'deferred', targets: [agentsPath], reason: err.message });
           }
         } else {

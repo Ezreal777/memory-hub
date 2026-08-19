@@ -107,6 +107,8 @@ writeback；零星变更由每小时一次的兜底扫描收口；daemon 启动�
 | `core.enabled` / `core.reassertEveryRound` | 长期核心层（core/）总开关与每轮重申开关（缺省均 `true`：增量写回无条件重申 core 条目，App 侧被清后自动复活） |
 | `core.maxEntries` / `core.survivalDays` / `core.minScore` / `core.scanIntervalMs` | 核心层容量上限（缺省 50）/ 晋升存活信号天数（缺省 15）/ 提名最低信号分（缺省 3）/ daemon 自动扫描间隔（缺省 7 天） |
 | `core.autoPromote` / `core.autoConfidence` / `core.maxAutoPromotePerScan` | LLM 终审自动晋升（缺省 `true`）：verdict=promote 且置信度 ≥ 门槛（缺省 0.7）才自动写 core，每轮最多 N 条（缺省 3）；无 LLM 终审产出（冷却/降级）只提名不拍板；`hub promote demote` 可撤销，`false` 回退人工 apply 把关 |
+| `apps[].maxRegionEntries` | 聚合文件（codex AGENTS.md）标记区条目硬上限（缺省 120）：core 条目永不淘汰，其余自新向旧滚动；超出部分不写回（完整内容在 wiki）。防回声雪球：曾全量写回把单文件滚到 11MB/1.2 万块，被按全文 H2 切节全量重摄取（单日 3.5 万份重复快照） |
+| （内置防线） | 回声四防线：codex.parse 只摄取标记区外；标记区硬上限；ingest 内容指纹去重（`state/source-fingerprints.json`，同 app 同内容只落一份快照）；巨文件拒摄取（>2MB 跳过，防同步 IO 拖死事件循环） |
 
 数据根目录缺省 `~/.memory-hub`，可用环境变量 **`MEMORY_HUB_ROOT`** 覆盖；
 用户可视目录缺省 `~/Desktop/Memory Hub`，可用 **`MEMORY_HUB_USER_ROOT`** 覆盖
